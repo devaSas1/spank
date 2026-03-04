@@ -1,3 +1,4 @@
 /spank
 dist/
 *.log
+.crush
