@@ -4,10 +4,10 @@
 
 ## Project Overview
 
-**spank** is a macOS CLI tool that detects physical hits/slaps on Apple Silicon MacBooks via the accelerometer and plays audio responses. Single-file Go application with embedded MP3 assets.
+**spank** is a macOS CLI tool that detects physical hits/slaps and plays audio responses. It supports Apple Silicon accelerometer input and a microphone-based fallback mode. Single-file Go application with embedded MP3 assets.
 
-- **Platform**: macOS on Apple Silicon (M2+) only
-- **Runtime requirement**: `sudo` (for IOKit HID accelerometer access)
+- **Platform**: macOS (accelerometer mode targets Apple Silicon; mic mode works without SPU access)
+- **Runtime requirement**: `sudo` for accelerometer mode (`--mic` does not require `sudo`)
 - **Architecture**: Single `main.go` file with embedded audio assets
 
 ## Commands
@@ -18,8 +18,10 @@
 # Build
 go build -o spank .
 
-# Run (requires sudo)
+# Run
 sudo ./spank
+./spank --mic          # microphone input mode (M1-friendly, no sudo)
+./spank --mic --strict --mic-device 1  # stricter mic classifier (reject voice-like triggers)
 sudo ./spank --sexy      # escalating responses mode
 sudo ./spank --halo      # Halo death sounds mode
 sudo ./spank --custom /path/to/mp3s  # custom audio directory
@@ -106,9 +108,9 @@ Key tuning parameters in `main.go`:
 
 ## Gotchas
 
-1. **Root required**: The app must run with `sudo` for IOKit HID access. The `run()` function checks `os.Geteuid() != 0`.
+1. **Root requirement depends on input**: Accelerometer mode requires `sudo` for IOKit HID access. Mic mode (`--mic`) does not.
 
-2. **Apple Silicon only**: Only builds for `darwin/arm64`. Intel Macs are not supported.
+2. **Apple Silicon accelerometer path**: Accelerometer mode builds/releases for `darwin/arm64`. Mic mode is the fallback when SPU accelerometer access is unavailable.
 
 3. **Private dependency**: `github.com/taigrr/apple-silicon-accelerometer` requires `GOPRIVATE` setting and GitHub PAT for CI.
 

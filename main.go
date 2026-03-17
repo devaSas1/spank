@@ -1,19 +1,22 @@
 // spank detects slaps/hits on the laptop and plays audio responses.
-// It reads the Apple Silicon accelerometer directly via IOKit HID —
-// no separate sensor daemon required. Needs sudo.
+// Default input is Apple Silicon accelerometer via IOKit HID (needs sudo).
+// Optional --mic input mode detects impact transients from microphone audio.
 package main
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -44,18 +47,25 @@ var sexyAudio embed.FS
 var haloAudio embed.FS
 
 var (
-	sexyMode     bool
-	haloMode     bool
-	customPath   string
-	customFiles  []string
-	fastMode     bool
-	minAmplitude float64
-	cooldownMs   int
-	stdioMode      bool
-	volumeScaling  bool
-	paused         bool
-	pausedMu       sync.RWMutex
-	speedRatio     float64
+	sexyMode        bool
+	haloMode        bool
+	customPath      string
+	customFiles     []string
+	micMode         bool
+	micDevice       string
+	strictMode      bool
+	fastMode        bool
+	cutOnSlap       bool
+	audioBackend    string
+	outputVolume    float64
+	feedbackGuardMs int
+	minAmplitude    float64
+	cooldownMs      int
+	stdioMode       bool
+	volumeScaling   bool
+	paused          bool
+	pausedMu        sync.RWMutex
+	speedRatio      float64
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -86,6 +96,13 @@ const (
 	// defaultSpeedRatio is the default playback speed (1.0 = normal).
 	defaultSpeedRatio = 1.0
 
+	// defaultOutputVolume is the global output gain (1.0 = unchanged).
+	defaultOutputVolume = 1.0
+
+	// defaultFeedbackGuardMs is an additional mic-only post-playback
+	// suppression window to reduce speaker feedback self-triggers.
+	defaultFeedbackGuardMs = 220
+
 	// defaultSensorPollInterval is how often we check for new accelerometer data.
 	defaultSensorPollInterval = 10 * time.Millisecond
 
@@ -95,6 +112,32 @@ const (
 
 	// sensorStartupDelay gives the sensor time to start producing data.
 	sensorStartupDelay = 100 * time.Millisecond
+
+	// defaultMicSampleRate is the ffmpeg capture sample rate in Hz.
+	defaultMicSampleRate = 16000
+
+	// defaultMicChunkSize is the number of PCM bytes per detection frame
+	// (20ms at 16kHz mono s16le = 320 samples = 640 bytes).
+	defaultMicChunkSize = 640
+
+	// recentRepeatWindow prevents replaying the same clip too soon.
+	recentRepeatWindow = 3
+
+	// audioBufferDefault is the speaker buffer for normal mode.
+	// Beep's speaker is most reliable around ~100ms on macOS.
+	audioBufferDefault = 100 * time.Millisecond
+
+	// audioBufferFast is the speaker buffer when --fast is enabled.
+	// Keep this lower than default for responsiveness, but not ultra-low.
+	audioBufferFast = 60 * time.Millisecond
+
+	// minInterruptHold is the minimum time a clip gets before a new slap can
+	// interrupt it. This avoids rapid-cut silence when files have short intros.
+	minInterruptHold = 140 * time.Millisecond
+
+	// rapidFireIntroSkip trims a small leading portion of clips in aggressive
+	// rapid-fire settings so audible content starts sooner.
+	rapidFireIntroSkip = 220 * time.Millisecond
 )
 
 type runtimeTuning struct {
@@ -159,20 +202,38 @@ func (sp *soundPack) loadFiles() error {
 		}
 	}
 	sort.Strings(sp.files)
+	if sp.mode == modeEscalation {
+		shuffleFiles(sp.files)
+	}
 	if len(sp.files) == 0 {
 		return fmt.Errorf("no audio files found in %s", sp.dir)
 	}
 	return nil
 }
 
+func shuffleFiles(files []string) {
+	var seed int64
+	var seedBuf [8]byte
+	if _, err := cryptorand.Read(seedBuf[:]); err == nil {
+		seed = int64(binary.LittleEndian.Uint64(seedBuf[:]))
+	} else {
+		seed = time.Now().UnixNano()
+	}
+	r := rand.New(rand.NewSource(seed))
+	r.Shuffle(len(files), func(i, j int) {
+		files[i], files[j] = files[j], files[i]
+	})
+}
+
 type slapTracker struct {
-	mu       sync.Mutex
-	score    float64
-	lastTime time.Time
-	total    int
-	halfLife float64 // seconds
-	scale    float64 // controls the escalation curve shape
-	pack     *soundPack
+	mu        sync.Mutex
+	score     float64
+	lastTime  time.Time
+	total     int
+	recentIdx []int
+	halfLife  float64 // seconds
+	scale     float64 // controls the escalation curve shape
+	pack      *soundPack
 }
 
 func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
@@ -184,9 +245,10 @@ func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
 	ssMax := 1.0 / (1.0 - math.Pow(0.5, cooldownSec/decayHalfLife))
 	scale := (ssMax - 1) / math.Log(float64(len(pack.files)+1))
 	return &slapTracker{
-		halfLife: decayHalfLife,
-		scale:    scale,
-		pack:     pack,
+		halfLife:  decayHalfLife,
+		recentIdx: make([]int, 0, recentRepeatWindow),
+		scale:     scale,
+		pack:      pack,
 	}
 }
 
@@ -205,16 +267,60 @@ func (st *slapTracker) record(now time.Time) (int, float64) {
 }
 
 func (st *slapTracker) getFile(score float64) string {
-	if st.pack.mode == modeRandom {
-		return st.pack.files[rand.Intn(len(st.pack.files))]
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	maxIdx := len(st.pack.files) - 1
+	poolMax := maxIdx
+	if st.pack.mode == modeEscalation {
+		// Escalation: 1-exp(-x) curve maps score to file index.
+		// At sustained max slap rate, score reaches ssMax which maps
+		// to the final file. Randomize within unlocked range to keep
+		// variety while preserving intensity progression.
+		baseIdx := min(int(float64(len(st.pack.files))*(1.0-math.Exp(-(score-1)/st.scale))), maxIdx)
+		// Keep at least 5 clips in the pool (idx 0..4) when available.
+		// With a 3-event no-repeat window, 4 clips forces a cycle pattern.
+		minPoolIdx := min(recentRepeatWindow+1, maxIdx)
+		poolMax = max(baseIdx, minPoolIdx)
 	}
 
-	// Escalation: 1-exp(-x) curve maps score to file index.
-	// At sustained max slap rate, score reaches ssMax which maps
-	// to the final file.
-	maxIdx := len(st.pack.files) - 1
-	idx := min(int(float64(len(st.pack.files)) * (1.0 - math.Exp(-(score-1)/st.scale))), maxIdx)
+	idx := st.pickIdxFromPool(poolMax)
+	st.rememberIdx(idx)
 	return st.pack.files[idx]
+}
+
+func (st *slapTracker) pickIdxFromPool(poolMax int) int {
+	if poolMax <= 0 {
+		return 0
+	}
+
+	candidates := make([]int, 0, poolMax+1)
+	for i := 0; i <= poolMax; i++ {
+		if !st.inRecent(i) {
+			candidates = append(candidates, i)
+		}
+	}
+	if len(candidates) == 0 {
+		// Pool is smaller than the no-repeat window.
+		return rand.Intn(poolMax + 1)
+	}
+	return candidates[rand.Intn(len(candidates))]
+}
+
+func (st *slapTracker) inRecent(idx int) bool {
+	for _, r := range st.recentIdx {
+		if r == idx {
+			return true
+		}
+	}
+	return false
+}
+
+func (st *slapTracker) rememberIdx(idx int) {
+	st.recentIdx = append(st.recentIdx, idx)
+	if len(st.recentIdx) > recentRepeatWindow {
+		st.recentIdx = st.recentIdx[len(st.recentIdx)-recentRepeatWindow:]
+	}
 }
 
 func main() {
@@ -224,7 +330,8 @@ func main() {
 		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID
 and plays audio responses when a slap or hit is detected.
 
-Requires sudo (for IOKit HID access to the accelerometer).
+By default it uses the accelerometer and requires sudo.
+Use --mic to detect impacts from microphone transients (no sudo).
 
 Use --sexy for a different experience. In sexy mode, the more you slap
 within a minute, the more intense the sounds become.
@@ -251,12 +358,19 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
 	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
+	cmd.Flags().BoolVar(&micMode, "mic", false, "Use microphone transient detection instead of accelerometer (no sudo)")
+	cmd.Flags().StringVar(&micDevice, "mic-device", "0", "avfoundation audio device index used by --mic (for example: 0, 1)")
+	cmd.Flags().BoolVar(&strictMode, "strict", false, "Stricter impact classifier for --mic (helps reject voice/screaming triggers)")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
+	cmd.Flags().BoolVar(&cutOnSlap, "cut-on-slap", false, "Stop current audio and restart immediately on each new slap (can be choppy)")
+	cmd.Flags().StringVar(&audioBackend, "audio-backend", "beep", "Audio output backend: beep or afplay")
 	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
+	cmd.Flags().IntVar(&feedbackGuardMs, "feedback-guard", defaultFeedbackGuardMs, "Extra mic-only suppression window in ms to reduce speaker self-trigger")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
+	cmd.Flags().Float64Var(&outputVolume, "output-volume", defaultOutputVolume, "Master playback volume cap (0.0-1.0)")
 	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
@@ -265,7 +379,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 }
 
 func run(ctx context.Context, tuning runtimeTuning) error {
-	if os.Geteuid() != 0 {
+	if !micMode && os.Geteuid() != 0 {
 		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
 	}
 
@@ -288,6 +402,29 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	}
 	if tuning.cooldown <= 0 {
 		return fmt.Errorf("--cooldown must be greater than 0")
+	}
+	if outputVolume < 0 || outputVolume > 1 {
+		return fmt.Errorf("--output-volume must be between 0.0 and 1.0")
+	}
+	if feedbackGuardMs < 0 {
+		return fmt.Errorf("--feedback-guard must be 0 or greater")
+	}
+	audioBackend = strings.ToLower(strings.TrimSpace(audioBackend))
+	if audioBackend != "beep" && audioBackend != "afplay" {
+		return fmt.Errorf("--audio-backend must be one of: beep, afplay")
+	}
+	if audioBackend == "afplay" {
+		if _, err := exec.LookPath("afplay"); err != nil {
+			return fmt.Errorf("audio backend 'afplay' requires afplay in PATH")
+		}
+		defer stopAfplayPlayback()
+		defer cleanupAfplayTempFiles()
+	}
+	if micMode && strings.TrimSpace(micDevice) == "" {
+		return fmt.Errorf("--mic-device cannot be empty")
+	}
+	if strictMode && !micMode {
+		return fmt.Errorf("--strict only applies with --mic")
 	}
 
 	var pack *soundPack
@@ -323,6 +460,10 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	if micMode {
+		return listenForMicSlaps(ctx, pack, tuning)
+	}
+
 	// Create shared memory for accelerometer data.
 	accelRing, err := shm.CreateRing(shm.NameAccel)
 	if err != nil {
@@ -357,6 +498,241 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	time.Sleep(sensorStartupDelay)
 
 	return listenForSlaps(ctx, pack, accelRing, tuning)
+}
+
+func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTuning) error {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return fmt.Errorf("mic mode requires ffmpeg in PATH (try: brew install ffmpeg)")
+	}
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-f", "avfoundation",
+		"-i", ":" + micDevice,
+		"-ac", "1",
+		"-ar", fmt.Sprintf("%d", defaultMicSampleRate),
+		"-f", "s16le",
+		"-",
+	}
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("mic mode: creating ffmpeg stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("mic mode: starting ffmpeg: %w", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	tracker := newSlapTracker(pack, tuning.cooldown)
+	speakerInit := false
+	var lastYell time.Time
+	noiseFloor := 0.0
+	strictState := micStrictState{}
+	chunk := make([]byte, defaultMicChunkSize)
+
+	if stdioMode {
+		go readStdinCommands()
+	}
+
+	presetLabel := "default"
+	if fastMode {
+		presetLabel = "fast"
+	}
+	classifierLabel := "normal"
+	if strictMode {
+		classifierLabel = "strict"
+	}
+	fmt.Printf("spank: listening for slaps in %s mode with %s tuning (input=mic classifier=%s)... (ctrl+c to quit)\n", pack.name, presetLabel, classifierLabel)
+	if stdioMode {
+		fmt.Println(`{"status":"ready"}`)
+	}
+
+	minGap := time.Duration(cooldownMs) * time.Millisecond
+	feedbackGap := time.Duration(feedbackGuardMs) * time.Millisecond
+	if feedbackGap > minGap {
+		minGap = feedbackGap
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("\nbye!")
+			return nil
+		default:
+		}
+
+		if _, err := io.ReadFull(stdout, chunk); err != nil {
+			if ctx.Err() != nil {
+				fmt.Println("\nbye!")
+				return nil
+			}
+			msg := strings.TrimSpace(stderr.String())
+			if msg != "" {
+				return fmt.Errorf("mic mode input stream ended: %w (%s)", err, msg)
+			}
+			return fmt.Errorf("mic mode input stream ended: %w", err)
+		}
+
+		pausedMu.RLock()
+		isPaused := paused
+		pausedMu.RUnlock()
+		if isPaused {
+			continue
+		}
+
+		stats := micFrameStatsFromPCM(chunk, noiseFloor)
+		noiseFloor = stats.NoiseFloor
+		amplitude := stats.Amplitude
+
+		if time.Since(lastYell) <= minGap {
+			continue
+		}
+		if strictMode {
+			if !strictState.accept(stats, minAmplitude) {
+				continue
+			}
+		} else {
+			if amplitude < minAmplitude {
+				continue
+			}
+		}
+
+		now := time.Now()
+		lastYell = now
+		num, score := tracker.record(now)
+		file := tracker.getFile(score)
+		if stdioMode {
+			event := map[string]interface{}{
+				"timestamp":  now.Format(time.RFC3339Nano),
+				"slapNumber": num,
+				"amplitude":  amplitude,
+				"severity":   "mic",
+				"file":       file,
+			}
+			if strictMode {
+				event["classifier"] = "strict"
+				event["crest"] = stats.Crest
+				event["hfRatio"] = stats.HFRatio
+			}
+			if data, err := json.Marshal(event); err == nil {
+				fmt.Println(string(data))
+			}
+		} else {
+			if strictMode {
+				fmt.Printf("slap #%d [mic/strict amp=%.5f crest=%.2f hf=%.2f] -> %s\n", num, amplitude, stats.Crest, stats.HFRatio, file)
+			} else {
+				fmt.Printf("slap #%d [mic amp=%.5f] -> %s\n", num, amplitude, file)
+			}
+		}
+		playAudio(pack, file, amplitude, &speakerInit)
+	}
+}
+
+type micFrameStats struct {
+	Amplitude  float64
+	NoiseFloor float64
+	RMS        float64
+	Peak       float64
+	Crest      float64
+	HFRatio    float64
+}
+
+type micStrictState struct {
+	prevAmplitude float64
+	ambientEMA    float64
+}
+
+func (s *micStrictState) accept(stats micFrameStats, threshold float64) bool {
+	amp := stats.Amplitude
+	if s.ambientEMA == 0 {
+		s.ambientEMA = amp
+	} else {
+		s.ambientEMA = s.ambientEMA*0.95 + amp*0.05
+	}
+
+	prev := math.Max(s.prevAmplitude, 0.001)
+	rise := amp / prev
+	dominatesAmbient := amp > s.ambientEMA*1.8
+	strong := amp >= threshold*1.25
+	impulsive := stats.Crest >= 4.0
+	bright := stats.HFRatio >= 0.55
+	sudden := rise >= 2.3 || amp >= threshold*3.5
+
+	hit := strong && impulsive && bright && dominatesAmbient && sudden
+	s.prevAmplitude = amp
+	return hit
+}
+
+func micFrameStatsFromPCM(chunk []byte, noiseFloor float64) micFrameStats {
+	if len(chunk) < 2 {
+		return micFrameStats{NoiseFloor: noiseFloor}
+	}
+
+	sampleCount := len(chunk) / 2
+	var sumSquares float64
+	var diffSquares float64
+	var peak float64
+	var prevSample float64
+	havePrev := false
+	for i := 0; i+1 < len(chunk); i += 2 {
+		sample := int16(binary.LittleEndian.Uint16(chunk[i : i+2]))
+		v := float64(sample) / 32768.0
+		sumSquares += v * v
+		absV := math.Abs(v)
+		if absV > peak {
+			peak = absV
+		}
+		if havePrev {
+			d := v - prevSample
+			diffSquares += d * d
+		}
+		prevSample = v
+		havePrev = true
+	}
+	rms := math.Sqrt(sumSquares / float64(sampleCount))
+	diffRMS := math.Sqrt(diffSquares / float64(max(sampleCount-1, 1)))
+	hfRatio := diffRMS / (rms + 1e-9)
+
+	// Track ambient mic noise with a slowly moving floor.
+	updatedNoiseFloor := noiseFloor
+	if updatedNoiseFloor == 0 {
+		updatedNoiseFloor = rms
+	} else if rms < updatedNoiseFloor {
+		updatedNoiseFloor = updatedNoiseFloor*0.98 + rms*0.02
+	} else {
+		updatedNoiseFloor = updatedNoiseFloor*0.999 + rms*0.001
+	}
+
+	amplitude := rms - updatedNoiseFloor
+	if amplitude < 0 {
+		amplitude = 0
+	}
+	crest := peak / (rms + 1e-9)
+	return micFrameStats{
+		Amplitude:  amplitude,
+		NoiseFloor: updatedNoiseFloor,
+		RMS:        rms,
+		Peak:       peak,
+		Crest:      crest,
+		HFRatio:    hfRatio,
+	}
+}
+
+func micAmplitudeFromPCM(chunk []byte, noiseFloor float64) (amplitude float64, updatedNoiseFloor float64) {
+	stats := micFrameStatsFromPCM(chunk, noiseFloor)
+	return stats.Amplitude, stats.NoiseFloor
 }
 
 func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
@@ -451,11 +827,18 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		} else {
 			fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", num, ev.Severity, ev.Amplitude, file)
 		}
-		go playAudio(pack, file, ev.Amplitude, &speakerInit)
+		playAudio(pack, file, ev.Amplitude, &speakerInit)
 	}
 }
 
 var speakerMu sync.Mutex
+var activePlaybackStop func()
+var activePlaybackID uint64
+var activePlaybackStartedAt time.Time
+var afplayMu sync.Mutex
+var activeAfplay *exec.Cmd
+var afplayTempMu sync.Mutex
+var afplayTempFiles = map[string]string{}
 
 // amplitudeToVolume maps a detected amplitude to a beep/effects.Volume
 // level. Amplitude typically ranges from ~0.05 (light tap) to ~1.0+
@@ -466,10 +849,10 @@ var speakerMu sync.Mutex
 // (base 2): -3.0 is ~1/8 volume, 0.0 is full volume.
 func amplitudeToVolume(amplitude float64) float64 {
 	const (
-		minAmp   = 0.05  // softest detectable
-		maxAmp   = 0.80  // treat anything above this as max
-		minVol   = -3.0  // quietest playback (1/8 volume with base 2)
-		maxVol   = 0.0   // full volume
+		minAmp = 0.05 // softest detectable
+		maxAmp = 0.80 // treat anything above this as max
+		minVol = -3.0 // quietest playback (1/8 volume with base 2)
+		maxVol = 0.0  // full volume
 	)
 
 	// Clamp
@@ -490,9 +873,127 @@ func amplitudeToVolume(amplitude float64) float64 {
 	return minVol + t*(maxVol-minVol)
 }
 
+func speakerBufferDuration() time.Duration {
+	if fastMode {
+		return audioBufferFast
+	}
+	return audioBufferDefault
+}
+
+func stopAfplayPlayback() {
+	afplayMu.Lock()
+	defer afplayMu.Unlock()
+	if activeAfplay != nil && activeAfplay.Process != nil {
+		_ = activeAfplay.Process.Kill()
+	}
+	activeAfplay = nil
+}
+
+func cleanupAfplayTempFiles() {
+	afplayTempMu.Lock()
+	defer afplayTempMu.Unlock()
+	for _, p := range afplayTempFiles {
+		_ = os.Remove(p)
+	}
+	afplayTempFiles = map[string]string{}
+}
+
+func resolveAfplayPath(pack *soundPack, path string) (string, error) {
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+	if pack.custom {
+		return "", fmt.Errorf("custom audio file not found: %s", path)
+	}
+
+	afplayTempMu.Lock()
+	if cached, ok := afplayTempFiles[path]; ok {
+		if _, err := os.Stat(cached); err == nil {
+			afplayTempMu.Unlock()
+			return cached, nil
+		}
+		delete(afplayTempFiles, path)
+	}
+	afplayTempMu.Unlock()
+
+	data, err := pack.fs.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read embedded audio %s: %w", path, err)
+	}
+	tmp, err := os.CreateTemp("", "spank-audio-*.mp3")
+	if err != nil {
+		return "", fmt.Errorf("create temp audio: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("write temp audio: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("close temp audio: %w", err)
+	}
+
+	afplayTempMu.Lock()
+	afplayTempFiles[path] = tmp.Name()
+	afplayTempMu.Unlock()
+	return tmp.Name(), nil
+}
+
+func playAudioWithAfplay(pack *soundPack, path string) {
+	if outputVolume <= 0 {
+		return
+	}
+
+	audioPath, err := resolveAfplayPath(pack, path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "spank: %v\n", err)
+		return
+	}
+
+	cmd := exec.Command("afplay", "-v", fmt.Sprintf("%.3f", outputVolume), audioPath)
+	if cutOnSlap {
+		afplayMu.Lock()
+		if activeAfplay != nil && activeAfplay.Process != nil {
+			_ = activeAfplay.Process.Kill()
+		}
+		activeAfplay = cmd
+		afplayMu.Unlock()
+
+		go func(local *exec.Cmd, clip string) {
+			if err := local.Run(); err != nil && !strings.Contains(err.Error(), "signal: killed") {
+				fmt.Fprintf(os.Stderr, "spank: afplay %s: %v\n", clip, err)
+			}
+			afplayMu.Lock()
+			if activeAfplay == local {
+				activeAfplay = nil
+			}
+			afplayMu.Unlock()
+		}(cmd, audioPath)
+		return
+	}
+
+	go func(local *exec.Cmd, clip string) {
+		if err := local.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "spank: afplay %s: %v\n", clip, err)
+		}
+	}(cmd, audioPath)
+}
+
 func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *bool) {
+	if outputVolume <= 0 {
+		return
+	}
+
+	if audioBackend == "afplay" {
+		playAudioWithAfplay(pack, path)
+		return
+	}
+
 	var streamer beep.StreamSeekCloser
 	var format beep.Format
+	var closePlayback func()
+	var closeOnce sync.Once
 
 	if pack.custom {
 		file, err := os.Open(path)
@@ -500,11 +1001,17 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 			fmt.Fprintf(os.Stderr, "spank: open %s: %v\n", path, err)
 			return
 		}
-		defer file.Close()
 		streamer, format, err = mp3.Decode(file)
 		if err != nil {
+			_ = file.Close()
 			fmt.Fprintf(os.Stderr, "spank: decode %s: %v\n", path, err)
 			return
+		}
+		closePlayback = func() {
+			closeOnce.Do(func() {
+				_ = streamer.Close()
+				_ = file.Close()
+			})
 		}
 	} else {
 		data, err := pack.fs.ReadFile(path)
@@ -517,15 +1024,31 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 			fmt.Fprintf(os.Stderr, "spank: decode %s: %v\n", path, err)
 			return
 		}
+		closePlayback = func() {
+			closeOnce.Do(func() {
+				_ = streamer.Close()
+			})
+		}
 	}
-	defer streamer.Close()
+
+	// In rapid-fire cut mode, skip a short intro so audible content starts sooner.
+	if cutOnSlap && time.Duration(cooldownMs)*time.Millisecond <= 180 {
+		skipSamples := format.SampleRate.N(rapidFireIntroSkip)
+		if total := streamer.Len(); total > 0 && skipSamples < total {
+			_ = streamer.Seek(skipSamples)
+		}
+	}
 
 	speakerMu.Lock()
 	if !*speakerInit {
-		speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
+		if err := speaker.Init(format.SampleRate, format.SampleRate.N(speakerBufferDuration())); err != nil {
+			speakerMu.Unlock()
+			closePlayback()
+			fmt.Fprintf(os.Stderr, "spank: speaker init failed: %v\n", err)
+			return
+		}
 		*speakerInit = true
 	}
-	speakerMu.Unlock()
 
 	// Optionally scale volume based on slap amplitude
 	var source beep.Streamer = streamer
@@ -546,11 +1069,49 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 		source = beep.Resample(4, fakeRate, format.SampleRate, source)
 	}
 
-	done := make(chan bool)
+	// Apply a master output cap to avoid mic feedback loops from loud clips.
+	if outputVolume > 0 && outputVolume < 1 {
+		source = &effects.Volume{
+			Streamer: source,
+			Base:     2,
+			Volume:   math.Log2(outputVolume),
+			Silent:   false,
+		}
+	}
+
+	var playbackID uint64
+	if cutOnSlap {
+		// Hard-cut current clip so rapid slaps immediately play the new clip.
+		if activePlaybackStop != nil {
+			if !activePlaybackStartedAt.IsZero() && time.Since(activePlaybackStartedAt) < minInterruptHold {
+				speakerMu.Unlock()
+				closePlayback()
+				return
+			}
+			speaker.Clear()
+			activePlaybackStop()
+			activePlaybackStop = nil
+			activePlaybackStartedAt = time.Time{}
+		}
+
+		activePlaybackID++
+		playbackID = activePlaybackID
+		activePlaybackStop = closePlayback
+		activePlaybackStartedAt = time.Now()
+	}
+
 	speaker.Play(beep.Seq(source, beep.Callback(func() {
-		done <- true
+		closePlayback()
+		if cutOnSlap {
+			speakerMu.Lock()
+			if activePlaybackID == playbackID {
+				activePlaybackStop = nil
+				activePlaybackStartedAt = time.Time{}
+			}
+			speakerMu.Unlock()
+		}
 	})))
-	<-done
+	speakerMu.Unlock()
 }
 
 // stdinCommand represents a command received via stdin

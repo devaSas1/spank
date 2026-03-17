@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 // resetGlobals resets global state before each test
@@ -450,5 +452,174 @@ func TestNoOutputWhenStdioModeDisabled(t *testing.T) {
 
 	if minAmplitude != 0.5 {
 		t.Errorf("expected minAmplitude 0.5, got %f", minAmplitude)
+	}
+}
+
+func pcmFromInt16(samples []int16) []byte {
+	out := make([]byte, len(samples)*2)
+	for i, s := range samples {
+		binary.LittleEndian.PutUint16(out[i*2:i*2+2], uint16(s))
+	}
+	return out
+}
+
+func sinePCM(freqHz float64, peak int16, sampleRate int, sampleCount int) []byte {
+	samples := make([]int16, sampleCount)
+	for i := 0; i < sampleCount; i++ {
+		v := math.Sin(2 * math.Pi * freqHz * float64(i) / float64(sampleRate))
+		samples[i] = int16(v * float64(peak))
+	}
+	return pcmFromInt16(samples)
+}
+
+func TestMicAmplitudeFromPCM(t *testing.T) {
+	noiseSamples := make([]int16, 320)
+	for i := range noiseSamples {
+		noiseSamples[i] = 700
+	}
+
+	noiseChunk := pcmFromInt16(noiseSamples)
+	amp, floor := micAmplitudeFromPCM(noiseChunk, 0)
+	if amp > 0.001 {
+		t.Fatalf("expected near-zero amplitude for baseline chunk, got %f", amp)
+	}
+	if floor <= 0 {
+		t.Fatalf("expected positive noise floor, got %f", floor)
+	}
+
+	amp2, floor2 := micAmplitudeFromPCM(noiseChunk, floor)
+	if amp2 > 0.005 {
+		t.Fatalf("expected low amplitude for repeated baseline chunk, got %f", amp2)
+	}
+	if floor2 <= 0 {
+		t.Fatalf("expected positive updated floor, got %f", floor2)
+	}
+
+	impactSamples := make([]int16, 320)
+	for i := 150; i < 162; i++ {
+		if i%2 == 0 {
+			impactSamples[i] = 28000
+		} else {
+			impactSamples[i] = -28000
+		}
+	}
+	impactChunk := pcmFromInt16(impactSamples)
+	impactAmp, _ := micAmplitudeFromPCM(impactChunk, floor2)
+	if impactAmp <= 0.05 {
+		t.Fatalf("expected impact amplitude > 0.05, got %f", impactAmp)
+	}
+}
+
+func TestMicStrictClassifierRejectsVoice(t *testing.T) {
+	noiseSamples := make([]int16, 320)
+	for i := range noiseSamples {
+		noiseSamples[i] = 700
+	}
+	noiseStats := micFrameStatsFromPCM(pcmFromInt16(noiseSamples), 0)
+
+	voiceChunk := sinePCM(440, 12000, defaultMicSampleRate, 320)
+	voiceStats := micFrameStatsFromPCM(voiceChunk, noiseStats.NoiseFloor)
+	if voiceStats.Crest >= 4.0 {
+		t.Fatalf("expected voice crest < 4.0, got %f", voiceStats.Crest)
+	}
+	if voiceStats.HFRatio >= 0.55 {
+		t.Fatalf("expected voice hf ratio < 0.55, got %f", voiceStats.HFRatio)
+	}
+
+	state := micStrictState{}
+	if state.accept(voiceStats, 0.02) {
+		t.Fatalf("strict classifier should reject voice-like chunk: %+v", voiceStats)
+	}
+}
+
+func TestMicStrictClassifierAcceptsImpact(t *testing.T) {
+	noiseSamples := make([]int16, 320)
+	for i := range noiseSamples {
+		noiseSamples[i] = 700
+	}
+	noiseStats := micFrameStatsFromPCM(pcmFromInt16(noiseSamples), 0)
+
+	impactSamples := make([]int16, 320)
+	for i := 148; i < 164; i++ {
+		if i%2 == 0 {
+			impactSamples[i] = 30000
+		} else {
+			impactSamples[i] = -30000
+		}
+	}
+	impactStats := micFrameStatsFromPCM(pcmFromInt16(impactSamples), noiseStats.NoiseFloor)
+
+	state := micStrictState{}
+	_ = state.accept(noiseStats, 0.05)
+	if !state.accept(impactStats, 0.05) {
+		t.Fatalf("strict classifier should accept impact-like chunk: %+v", impactStats)
+	}
+}
+
+func TestSexyModeAvoidsLastThreeRepeats(t *testing.T) {
+	pack := &soundPack{
+		mode:  modeEscalation,
+		files: []string{"a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3"},
+	}
+	tracker := newSlapTracker(pack, 750*time.Millisecond)
+
+	recent := make([]string, 0, 3)
+	for i := 0; i < 80; i++ {
+		// High score unlocks the full range so this exercises no-repeat logic.
+		cur := tracker.getFile(20.0)
+		for _, r := range recent {
+			if cur == r {
+				t.Fatalf("got repeat within last 3 at iteration %d: %s", i, cur)
+			}
+		}
+		recent = append(recent, cur)
+		if len(recent) > 3 {
+			recent = recent[1:]
+		}
+	}
+}
+
+func TestRandomModeAvoidsLastThreeRepeats(t *testing.T) {
+	pack := &soundPack{
+		mode:  modeRandom,
+		files: []string{"a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3"},
+	}
+	tracker := newSlapTracker(pack, 750*time.Millisecond)
+
+	recent := make([]string, 0, 3)
+	for i := 0; i < 80; i++ {
+		cur := tracker.getFile(1.0)
+		for _, r := range recent {
+			if cur == r {
+				t.Fatalf("random mode repeated within last 3 at iteration %d: %s", i, cur)
+			}
+		}
+		recent = append(recent, cur)
+		if len(recent) > 3 {
+			recent = recent[1:]
+		}
+	}
+}
+
+func TestSexyModeAvoidsLastThreeRepeatsAtLowScore(t *testing.T) {
+	pack := &soundPack{
+		mode:  modeEscalation,
+		files: []string{"a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3"},
+	}
+	tracker := newSlapTracker(pack, 750*time.Millisecond)
+
+	recent := make([]string, 0, 3)
+	for i := 0; i < 80; i++ {
+		// Low score exercises early-tier pool sizing.
+		cur := tracker.getFile(1.0)
+		for _, r := range recent {
+			if cur == r {
+				t.Fatalf("low-score sexy mode repeated within last 3 at iteration %d: %s", i, cur)
+			}
+		}
+		recent = append(recent, cur)
+		if len(recent) > 3 {
+			recent = recent[1:]
+		}
 	}
 }

@@ -10,12 +10,13 @@ Slap your MacBook, it yells back.
 
 > "peak engineering" — [@tylertaewook](https://x.com/tylertaewook)
 
-Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses. Single binary, no dependencies.
+Uses either the Apple Silicon accelerometer (IOKit HID) or microphone transients (`--mic`) to detect physical hits and play audio responses.
 
 ## Requirements
 
-- macOS on Apple Silicon (M2+)
-- `sudo` (for IOKit HID accelerometer access)
+- macOS
+- `sudo` (accelerometer mode only)
+- `ffmpeg` (microphone mode only, `--mic`)
 - Go 1.26+ (if building from source)
 
 ## Install
@@ -40,11 +41,18 @@ go install github.com/taigrr/spank@latest
 # Normal mode — says "ow!" when slapped
 sudo spank
 
+# M1-friendly mode — microphone transient detection (no sudo)
+spank --mic
+spank --mic --mic-device 1   # choose a different input device index
+spank --mic --mic-device 1 --strict  # reject most voice/scream triggers
+
 # Sexy mode — escalating responses based on slap frequency
 sudo spank --sexy
+spank --mic --sexy
 
 # Halo mode — plays Halo death sounds when slapped
 sudo spank --halo
+spank --mic --halo
 
 # Fast mode — faster polling and shorter cooldown
 sudo spank --fast
@@ -65,17 +73,33 @@ sudo spank --cooldown 600
 sudo spank --speed 0.7   # slower and deeper
 sudo spank --speed 1.5   # faster
 sudo spank --sexy --speed 0.6
+
+# If mic mode is too sensitive, increase threshold
+spank --mic --min-amplitude 0.08
+spank --mic --strict --min-amplitude 0.07 --cooldown 700
 ```
 
 ### Modes
 
 **Pain mode** (default): Randomly plays from 10 pain/protest audio clips when a slap is detected.
 
-**Sexy mode** (`--sexy`): Tracks slaps within a rolling 5-minute window. The more you slap, the more intense the audio response. 60 levels of escalation.
+**Sexy mode** (`--sexy`): Tracks slaps within a rolling 5-minute window. The more you slap, the more intense the audio response. 60 levels of escalation. File names do not need numeric ordering; clips are randomized within the current escalation tier and immediate repeats are avoided.
 
 **Halo mode** (`--halo`): Randomly plays from death sound effects from the Halo video game series when a slap is detected.
 
 **Custom mode** (`--custom`): Randomly plays MP3 files from a custom directory you specify.
+
+Randomized modes use a short anti-repeat window: a clip will not replay if it appeared in the previous 3 events (when enough alternatives exist).
+
+**Mic input mode** (`--mic`): Uses microphone spikes to detect taps/slaps. Works without `sudo` and is useful on machines without accelerometer support (for example many M1 models). Use `--mic-device` if you need a non-default mic index.
+
+**Strict mic classifier** (`--strict` with `--mic`): favors short, impact-like transients and suppresses sustained voice energy (for example yelling/screaming).
+
+To list available AVFoundation device indices:
+
+```bash
+ffmpeg -f avfoundation -list_devices true -i ""
+```
 
 ### Detection tuning
 
@@ -91,7 +115,9 @@ Control detection sensitivity with `--min-amplitude` (default: `0.05`):
 - Medium values (e.g., 0.15-0.30): Balanced sensitivity
 - Higher values (e.g., 0.30-0.50): Only strong impacts trigger sounds
 
-The value represents the minimum acceleration amplitude (in g-force) required to trigger a sound.
+In accelerometer mode, this is acceleration amplitude (g-force).
+In mic mode, this is normalized transient strength above the ambient noise floor.
+In strict mic mode, start around `0.06-0.09` and tune from there.
 
 ## Running as a Service
 
@@ -210,8 +236,8 @@ sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
 
 ## How it works
 
-1. Reads raw accelerometer data directly via IOKit HID (Apple SPU sensor)
-2. Runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
+1. Reads raw accelerometer data via IOKit HID, or audio PCM via `ffmpeg` in `--mic` mode
+2. Runs impact detection (accelerometer vibration detector, or mic transient detector)
 3. When a significant impact is detected, plays an embedded MP3 response
 4. **Optional volume scaling** (`--volume-scaling`) — light taps play quietly, hard slaps play at full volume
 5. **Optional speed control** (`--speed`) — adjusts playback speed and pitch (0.5 = half speed, 2.0 = double speed)
