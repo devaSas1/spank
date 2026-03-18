@@ -18,6 +18,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -49,6 +51,7 @@ var haloAudio embed.FS
 var (
 	sexyMode        bool
 	haloMode        bool
+	susMode         bool
 	customPath      string
 	customFiles     []string
 	micMode         bool
@@ -169,15 +172,37 @@ func applyFastOverlay(base runtimeTuning) runtimeTuning {
 }
 
 type soundPack struct {
-	name   string
-	fs     embed.FS
-	dir    string
-	mode   playMode
-	files  []string
-	custom bool
+	name     string
+	fs       embed.FS
+	dir      string
+	mode     playMode
+	files    []string
+	custom   bool
+	isSus    bool
+	susFiles map[int][]string
 }
 
 func (sp *soundPack) loadFiles() error {
+	if sp.isSus {
+		sp.susFiles = make(map[int][]string)
+		levels := []string{"1_nani", "2_tsun", "3_kyaa", "4_yamete", "5_grabbed"}
+		for i, lvl := range levels {
+			path := sp.dir + "/audio/" + lvl
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				continue
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					ext := strings.ToLower(filepath.Ext(entry.Name()))
+					if ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".mov" || ext == ".aac" {
+						sp.susFiles[i+1] = append(sp.susFiles[i+1], path+"/"+entry.Name())
+					}
+				}
+			}
+		}
+		return nil
+	}
 	if sp.custom {
 		entries, err := os.ReadDir(sp.dir)
 		if err != nil {
@@ -234,6 +259,9 @@ type slapTracker struct {
 	halfLife  float64 // seconds
 	scale     float64 // controls the escalation curve shape
 	pack      *soundPack
+	susSlaps  []time.Time
+	susLevel  int
+	susBags   map[int][]int // index of files for each level
 }
 
 func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
@@ -249,12 +277,40 @@ func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
 		recentIdx: make([]int, 0, recentRepeatWindow),
 		scale:     scale,
 		pack:      pack,
+		susBags:   make(map[int][]int),
 	}
 }
 
-func (st *slapTracker) record(now time.Time) (int, float64) {
+func (st *slapTracker) record(now time.Time, amplitude float64) (int, float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+
+	if st.pack.isSus {
+		// Clean up old slaps in the 10-second window
+		cutoff := now.Add(-10 * time.Second)
+		var valid []time.Time
+		for _, s := range st.susSlaps {
+			if s.After(cutoff) {
+				valid = append(valid, s)
+			}
+		}
+		valid = append(valid, now)
+		st.susSlaps = valid
+
+		st.total++
+		
+		count := len(st.susSlaps)
+		if count >= 10 || amplitude > 0.8 {
+			st.susLevel = 4 // Yamete
+		} else if count >= 5 {
+			st.susLevel = 3 // Kyaa
+		} else if count >= 2 {
+			st.susLevel = 2 // Tsun
+		} else {
+			st.susLevel = 1 // Nani
+		}
+		return st.total, float64(st.susLevel)
+	}
 
 	if !st.lastTime.IsZero() {
 		elapsed := now.Sub(st.lastTime).Seconds()
@@ -266,27 +322,85 @@ func (st *slapTracker) record(now time.Time) (int, float64) {
 	return st.total, st.score
 }
 
-func (st *slapTracker) getFile(score float64) string {
+func (st *slapTracker) getFile(score float64) (string, int) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
+	if st.pack.isSus {
+		level := st.susLevel
+		if level == 0 {
+			level = 1
+		}
+		files := st.pack.susFiles[level]
+		if len(files) == 0 {
+			for l := 1; l <= 4; l++ {
+				if len(st.pack.susFiles[l]) > 0 {
+					files = st.pack.susFiles[l]
+					level = l
+					break
+				}
+			}
+		}
+		if len(files) == 0 {
+			return "", level
+		}
+
+		// Shuffle-bag logic
+		bag := st.susBags[level]
+		if len(bag) == 0 {
+			// Refill bag
+			bag = make([]int, len(files))
+			for i := range bag {
+				bag[i] = i
+			}
+			rand.Shuffle(len(bag), func(i, j int) {
+				bag[i], bag[j] = bag[j], bag[i]
+			})
+		}
+		idx := bag[0]
+		st.susBags[level] = bag[1:]
+		return files[idx], level
+	}
+
 	maxIdx := len(st.pack.files) - 1
 	poolMax := maxIdx
+
 	if st.pack.mode == modeEscalation {
 		// Escalation: 1-exp(-x) curve maps score to file index.
 		// At sustained max slap rate, score reaches ssMax which maps
 		// to the final file. Randomize within unlocked range to keep
 		// variety while preserving intensity progression.
-		baseIdx := min(int(float64(len(st.pack.files))*(1.0-math.Exp(-(score-1)/st.scale))), maxIdx)
+		baseIdx := int(float64(len(st.pack.files)) * (1.0 - math.Exp(-(score-1)/st.scale)))
+		if baseIdx > maxIdx {
+			baseIdx = maxIdx
+		}
 		// Keep at least 5 clips in the pool (idx 0..4) when available.
 		// With a 3-event no-repeat window, 4 clips forces a cycle pattern.
-		minPoolIdx := min(recentRepeatWindow+1, maxIdx)
-		poolMax = max(baseIdx, minPoolIdx)
+		minPoolIdx := recentRepeatWindow + 1
+		if minPoolIdx > maxIdx {
+			minPoolIdx = maxIdx
+		}
+		poolMax = baseIdx
+		if minPoolIdx > poolMax {
+			poolMax = minPoolIdx
+		}
 	}
 
 	idx := st.pickIdxFromPool(poolMax)
 	st.rememberIdx(idx)
-	return st.pack.files[idx]
+	return st.pack.files[idx], 0
+}
+
+func (sp *soundPack) getGrabbedFile() (string, int) {
+	if !sp.isSus {
+		return "", 0
+	}
+	files := sp.susFiles[5]
+	if len(files) == 0 {
+		return "", 5
+	}
+	idx := rand.Intn(len(files))
+	return files[idx], 5
 }
 
 func (st *slapTracker) pickIdxFromPool(poolMax int) int {
@@ -357,6 +471,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 
 	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
 	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
+	cmd.Flags().BoolVar(&susMode, "sus", false, "Enable desktop pet anime mode")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
 	cmd.Flags().BoolVar(&micMode, "mic", false, "Use microphone transient detection instead of accelerometer (no sudo)")
 	cmd.Flags().StringVar(&micDevice, "mic-device", "0", "avfoundation audio device index used by --mic (for example: 0, 1)")
@@ -390,11 +505,14 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	if haloMode {
 		modeCount++
 	}
+	if susMode {
+		modeCount++
+	}
 	if customPath != "" || len(customFiles) > 0 {
 		modeCount++
 	}
 	if modeCount > 1 {
-		return fmt.Errorf("--sexy, --halo, and --custom/--custom-files are mutually exclusive; pick one")
+		return fmt.Errorf("--sexy, --halo, --sus, and --custom/--custom-files are mutually exclusive; pick one")
 	}
 
 	if tuning.minAmplitude < 0 || tuning.minAmplitude > 1 {
@@ -427,6 +545,19 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		return fmt.Errorf("--strict only applies with --mic")
 	}
 
+	if susMode {
+		if runtime.GOOS == "darwin" && audioBackend == "beep" {
+			audioBackend = "afplay"
+		}
+		// Overlap sounds by default in sus mode
+		cutOnSlap = false
+		// Drop cooldown significantly to allow "rapid fire"
+		if tuning.cooldown == time.Duration(defaultCooldownMs)*time.Millisecond {
+			tuning.cooldown = 180 * time.Millisecond
+			cooldownMs = 180
+		}
+	}
+
 	var pack *soundPack
 	switch {
 	case len(customFiles) > 0:
@@ -442,6 +573,8 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		pack = &soundPack{name: "custom", mode: modeRandom, custom: true, files: customFiles}
 	case customPath != "":
 		pack = &soundPack{name: "custom", dir: customPath, mode: modeRandom, custom: true}
+	case susMode:
+		pack = &soundPack{name: "sus", dir: "sus_assets", mode: modeRandom, custom: true, isSus: true}
 	case sexyMode:
 		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
 	case haloMode:
@@ -460,8 +593,46 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	var overlayStdin io.WriteCloser
+	if susMode {
+		cmdOverlay := exec.Command("swift", "sus_overlay.swift", pack.dir+"/visual")
+		stdin, err := cmdOverlay.StdinPipe()
+		if err != nil {
+			fmt.Printf("spank warning: could not pipe to overlay: %v\n", err)
+		} else {
+			overlayStdin = stdin
+			if stdout, err := cmdOverlay.StdoutPipe(); err == nil {
+				if err := cmdOverlay.Start(); err != nil {
+					fmt.Printf("spank warning: could not start overlay: %v\n", err)
+				} else {
+					defer func() {
+						stdin.Close()
+						cmdOverlay.Wait()
+					}()
+					go func() {
+						scanner := bufio.NewScanner(stdout)
+						for scanner.Scan() {
+							line := scanner.Text()
+							if line == "grabbed" {
+								file, _ := pack.getGrabbedFile()
+								if file != "" {
+									var speakerInit bool
+									playAudio(pack, file, 1.0, &speakerInit)
+								}
+							}
+						}
+					}()
+				}
+			} else {
+				// Fallback if pipe fails
+				cmdOverlay.Stdout = os.Stdout
+				_ = cmdOverlay.Start()
+			}
+		}
+	}
+
 	if micMode {
-		return listenForMicSlaps(ctx, pack, tuning)
+		return listenForMicSlaps(ctx, pack, tuning, overlayStdin)
 	}
 
 	// Create shared memory for accelerometer data.
@@ -497,10 +668,10 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	// Give the sensor a moment to start producing data.
 	time.Sleep(sensorStartupDelay)
 
-	return listenForSlaps(ctx, pack, accelRing, tuning)
+	return listenForSlaps(ctx, pack, accelRing, tuning, overlayStdin)
 }
 
-func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTuning) error {
+func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTuning, overlayStdin io.Writer) error {
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		return fmt.Errorf("mic mode requires ffmpeg in PATH (try: brew install ffmpeg)")
@@ -611,8 +782,11 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 
 		now := time.Now()
 		lastYell = now
-		num, score := tracker.record(now)
-		file := tracker.getFile(score)
+		num, score := tracker.record(now, amplitude)
+		file, level := tracker.getFile(score)
+		if overlayStdin != nil && level > 0 {
+			fmt.Fprintf(overlayStdin, "%d\n", level)
+		}
 		if stdioMode {
 			event := map[string]interface{}{
 				"timestamp":  now.Format(time.RFC3339Nano),
@@ -635,8 +809,13 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 			} else {
 				fmt.Printf("slap #%d [mic amp=%.5f] -> %s\n", num, amplitude, file)
 			}
+			if !stdioMode {
+				printSusReaction(score)
+			}
 		}
-		playAudio(pack, file, amplitude, &speakerInit)
+		if file != "" {
+			go playAudio(pack, file, amplitude, &speakerInit)
+		}
 	}
 }
 
@@ -656,10 +835,12 @@ type micStrictState struct {
 
 func (s *micStrictState) accept(stats micFrameStats, threshold float64) bool {
 	amp := stats.Amplitude
-	if s.ambientEMA == 0 {
+	if s.ambientEMA == 0 && amp > 0 {
 		s.ambientEMA = amp
-	} else {
+	} else if s.ambientEMA > 0 {
 		s.ambientEMA = s.ambientEMA*0.95 + amp*0.05
+	} else {
+		s.ambientEMA = stats.NoiseFloor
 	}
 
 	prev := math.Max(s.prevAmplitude, 0.001)
@@ -735,7 +916,7 @@ func micAmplitudeFromPCM(chunk []byte, noiseFloor float64) (amplitude float64, u
 	return stats.Amplitude, stats.NoiseFloor
 }
 
-func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
+func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning, overlayStdin io.Writer) error {
 	tracker := newSlapTracker(pack, tuning.cooldown)
 	speakerInit := false
 	det := detector.New()
@@ -811,8 +992,11 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		}
 
 		lastYell = now
-		num, score := tracker.record(now)
-		file := tracker.getFile(score)
+		num, score := tracker.record(now, ev.Amplitude)
+		file, level := tracker.getFile(score)
+		if overlayStdin != nil && level > 0 {
+			fmt.Fprintf(overlayStdin, "%d\n", level)
+		}
 		if stdioMode {
 			event := map[string]interface{}{
 				"timestamp":  now.Format(time.RFC3339Nano),
@@ -826,8 +1010,13 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 			}
 		} else {
 			fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", num, ev.Severity, ev.Amplitude, file)
+			if !stdioMode {
+				printSusReaction(score)
+			}
 		}
-		playAudio(pack, file, ev.Amplitude, &speakerInit)
+		if file != "" {
+			go playAudio(pack, file, ev.Amplitude, &speakerInit)
+		}
 	}
 }
 
@@ -899,8 +1088,10 @@ func cleanupAfplayTempFiles() {
 }
 
 func resolveAfplayPath(pack *soundPack, path string) (string, error) {
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
+	if abs, err := filepath.Abs(path); err == nil {
+		if _, err := os.Stat(abs); err == nil {
+			return abs, nil
+		}
 	}
 	if pack.custom {
 		return "", fmt.Errorf("custom audio file not found: %s", path)
@@ -952,32 +1143,24 @@ func playAudioWithAfplay(pack *soundPack, path string) {
 	}
 
 	cmd := exec.Command("afplay", "-v", fmt.Sprintf("%.3f", outputVolume), audioPath)
-	if cutOnSlap {
-		afplayMu.Lock()
-		if activeAfplay != nil && activeAfplay.Process != nil {
-			_ = activeAfplay.Process.Kill()
-		}
-		activeAfplay = cmd
-		afplayMu.Unlock()
 
-		go func(local *exec.Cmd, clip string) {
-			if err := local.Run(); err != nil && !strings.Contains(err.Error(), "signal: killed") {
-				fmt.Fprintf(os.Stderr, "spank: afplay %s: %v\n", clip, err)
-			}
-			afplayMu.Lock()
-			if activeAfplay == local {
-				activeAfplay = nil
-			}
-			afplayMu.Unlock()
-		}(cmd, audioPath)
-		return
+	afplayMu.Lock()
+	if activeAfplay != nil && activeAfplay.Process != nil {
+		_ = activeAfplay.Process.Kill()
 	}
+	activeAfplay = cmd
+	afplayMu.Unlock()
 
 	go func(local *exec.Cmd, clip string) {
-		if err := local.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "spank: afplay %s: %v\n", clip, err)
+		if err := local.Run(); err != nil && !strings.Contains(err.Error(), "signal: killed") {
+			// ignore normal kill errors
 		}
-	}(cmd, audioPath)
+		afplayMu.Lock()
+		if activeAfplay == local {
+			activeAfplay = nil
+		}
+		afplayMu.Unlock()
+	}(cmd, path)
 }
 
 func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *bool) {
@@ -1191,4 +1374,44 @@ func processCommands(r io.Reader, w io.Writer) {
 			}
 		}
 	}
+}
+
+func printSusReaction(score float64) {
+	// ANSI colored ASCII art based on escalation score!
+	pink := "\033[38;5;218m"
+	red := "\033[38;5;196m"
+	cyan := "\033[38;5;117m"
+	reset := "\033[0m"
+
+	var sprite string
+	if score < 2 {
+		sprite = `
+   \` + cyan + `/\_/\` + reset + `  
+  ( o.o ) 
+   > ^ <  
+  "Nani?"
+`
+	} else if score < 8 {
+		sprite = `
+   \` + cyan + `/\_/\` + reset + `  
+  ( ` + pink + `>.<` + reset + ` ) 
+   > ^ <  
+  "Hmph! Weak..."
+`
+	} else if score < 18 {
+		sprite = `
+   \` + cyan + `/\_/\` + reset + `  
+  ( ` + red + `≧ ω ≦` + reset + ` ) 
+   > ^ <  
+  "Kyaa~! Again!"
+`
+	} else {
+		sprite = `
+   \` + cyan + `/\_/\` + reset + `  
+  ( ` + red + `♥ ͜ʖ ♥` + reset + ` ) 
+   > ^ <  
+  "Y-Yamete kudasai... more..."
+`
+	}
+	fmt.Println(sprite)
 }

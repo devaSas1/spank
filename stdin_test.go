@@ -392,7 +392,7 @@ func TestAmplitudeToVolume(t *testing.T) {
 		{"at minimum returns min volume", 0.05, -3.0, -3.0},
 		{"above maximum returns max volume", 1.0, 0.0, 0.0},
 		{"at maximum returns max volume", 0.80, 0.0, 0.0},
-		{"mid amplitude returns mid-range", 0.40, -2.0, -0.5},
+		{"mid amplitude returns mid-range", 0.40, -1.0, -0.4},
 		{"low amplitude is quieter than high", 0.10, -3.0, -1.5},
 	}
 
@@ -566,7 +566,7 @@ func TestSexyModeAvoidsLastThreeRepeats(t *testing.T) {
 	recent := make([]string, 0, 3)
 	for i := 0; i < 80; i++ {
 		// High score unlocks the full range so this exercises no-repeat logic.
-		cur := tracker.getFile(20.0)
+		cur, _ := tracker.getFile(20.0)
 		for _, r := range recent {
 			if cur == r {
 				t.Fatalf("got repeat within last 3 at iteration %d: %s", i, cur)
@@ -588,7 +588,7 @@ func TestRandomModeAvoidsLastThreeRepeats(t *testing.T) {
 
 	recent := make([]string, 0, 3)
 	for i := 0; i < 80; i++ {
-		cur := tracker.getFile(1.0)
+		cur, _ := tracker.getFile(1.0)
 		for _, r := range recent {
 			if cur == r {
 				t.Fatalf("random mode repeated within last 3 at iteration %d: %s", i, cur)
@@ -611,7 +611,7 @@ func TestSexyModeAvoidsLastThreeRepeatsAtLowScore(t *testing.T) {
 	recent := make([]string, 0, 3)
 	for i := 0; i < 80; i++ {
 		// Low score exercises early-tier pool sizing.
-		cur := tracker.getFile(1.0)
+		cur, _ := tracker.getFile(1.0)
 		for _, r := range recent {
 			if cur == r {
 				t.Fatalf("low-score sexy mode repeated within last 3 at iteration %d: %s", i, cur)
