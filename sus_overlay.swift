@@ -46,6 +46,7 @@ class OverlayWindow: NSWindow {
         let newX = newOrigin.x + (event.locationInWindow.x - lastLocation.x)
         let newY = newOrigin.y + (event.locationInWindow.y - lastLocation.y)
         self.setFrameOrigin(NSPoint(x: newX, y: newY))
+        updateView() // Update mirroring while dragging
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -56,9 +57,15 @@ class OverlayWindow: NSWindow {
 
 let app = NSApplication.shared
 let window = OverlayWindow()
-let imageView = NSImageView(frame: window.contentView!.bounds)
+let contentView = window.contentView!
+let imageView = NSImageView(frame: contentView.bounds)
 imageView.imageScaling = .scaleProportionallyUpOrDown
-window.contentView?.addSubview(imageView)
+imageView.wantsLayer = true
+if let layer = imageView.layer {
+    layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+    layer.frame = contentView.bounds
+}
+contentView.addSubview(imageView)
 window.makeKeyAndOrderFront(nil)
 
 let args = CommandLine.arguments
@@ -70,6 +77,25 @@ var lastSlapTime = Date()
 var lastIdleChange = Date()
 
 func updateView() {
+    let screen = window.screen ?? NSScreen.main
+    let screenRect = screen?.frame ?? NSRect.zero
+    let windowCenterX = window.frame.midX
+    let shouldMirror = windowCenterX > screenRect.midX
+    
+    DispatchQueue.main.async {
+        if let layer = imageView.layer {
+            // Use a stable transform: reset to identity, then flip across the midline if needed
+            if shouldMirror {
+                // Translation-Scale-Translation to flip across the 100px vertical center
+                var transform = CATransform3DMakeTranslation(200, 0, 0)
+                transform = CATransform3DScale(transform, -1, 1, 1)
+                layer.transform = transform
+            } else {
+                layer.transform = CATransform3DIdentity
+            }
+        }
+    }
+
     if window.dragging {
         loadGrabbedImage()
     } else {
