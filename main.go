@@ -1,4 +1,4 @@
-// spank detects slaps/hits on the laptop and plays audio responses.
+// nina detects slaps/hits/sounds on the laptop and plays audio responses.
 // Default input is Apple Silicon accelerometer via IOKit HID (needs sudo).
 // Optional --mic input mode detects impact transients from microphone audio.
 package main
@@ -439,10 +439,10 @@ func (st *slapTracker) rememberIdx(idx int) {
 
 func main() {
 	cmd := &cobra.Command{
-		Use:   "spank",
-		Short: "Yells 'ow!' when you slap the laptop",
-		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID
-and plays audio responses when a slap or hit is detected.
+		Use:   "nina",
+		Short: "A desktop catgirl that reacts to sound",
+		Long: `nina is a desktop companion that reacts to the world around her.
+By default she listens for physical impact via the accelerometer or microphone.
 
 By default it uses the accelerometer and requires sudo.
 Use --mic to detect impacts from microphone transients (no sudo).
@@ -1138,7 +1138,7 @@ func playAudioWithAfplay(pack *soundPack, path string) {
 
 	audioPath, err := resolveAfplayPath(pack, path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "spank: %v\n", err)
+		fmt.Fprintf(os.Stderr, "nina: %v\n", err)
 		return
 	}
 

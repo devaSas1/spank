@@ -1,14 +1,15 @@
-# AGENTS.md
+# NINA.md
 
 > Guidelines for AI agents working in this repository.
 
 ## Project Overview
 
-**spank** is a macOS CLI tool that detects physical hits/slaps and plays audio responses. It supports Apple Silicon accelerometer input and a microphone-based fallback mode. Single-file Go application with embedded MP3 assets.
+**nina** is a macOS CLI tool that detects physical hits/slaps/sounds. It features **Nina**, an interactive desktop pet who reacts to slapping frequency and can be physically grabbed and moved around your screen.
 
 - **Platform**: macOS (accelerometer mode targets Apple Silicon; mic mode works without SPU access)
+- **Interactive Pet**: **Nina** is a resizable, draggable overlay with custom reaction/grabbed sprites.
 - **Runtime requirement**: `sudo` for accelerometer mode (`--mic` does not require `sudo`)
-- **Architecture**: Single `main.go` file with embedded audio assets
+- **Architecture**: Go backend for detection + Swift overlay for Nina's visuals.
 
 ## Commands
 
@@ -16,15 +17,15 @@
 
 ```bash
 # Build
-go build -o spank .
+go build -o nina .
 
 # Run
-sudo ./spank
-./spank --mic          # microphone input mode (M1-friendly, no sudo)
-./spank --mic --strict --mic-device 1  # stricter mic classifier (reject voice-like triggers)
-sudo ./spank --sexy      # escalating responses mode
-sudo ./spank --halo      # Halo death sounds mode
-sudo ./spank --custom /path/to/mp3s  # custom audio directory
+sudo ./nina
+./nina --mic --sus --mic-device 1  # Standard "Nina" mode (desktop pet)
+./nina --mic --strict --mic-device 1  # stricter mic classifier (reject voice-like triggers)
+sudo ./nina --sexy      # escalating responses (was moan mode)
+sudo ./nina --halo      # Halo death sounds mode
+sudo ./nina --custom /path/to/mp3s  # custom audio directory
 ```
 
 ### Install
