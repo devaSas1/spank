@@ -1,4 +1,4 @@
-# spank
+# nina
 
 [English][readme-en-link] | **简体中文**
 
@@ -20,51 +20,51 @@
 
 ## 安装
 
-从[最新版本](https://github.com/taigrr/spank/releases/latest)下载。
+从[最新版本](https://github.com/taigrr/nina/releases/latest)下载。
 
 或者从源代码构建：
 
 ```bash
-go install github.com/taigrr/spank@latest
+go install github.com/taigrr/nina@latest
 ```
 
-> **注意：** `go install` 会将二进制文件放在 `$GOBIN`（如果已设置）或 `$(go env GOPATH)/bin`（默认为 `~/go/bin`）。将其复制到系统路径以便 `sudo spank` 能够工作。例如，使用默认的 Go 设置：
+> **注意：** `go install` 会将二进制文件放在 `$GOBIN`（如果已设置）或 `$(go env GOPATH)/bin`（默认为 `~/go/bin`）。将其复制到系统路径以便 `sudo nina` 能够工作。例如，使用默认的 Go 设置：
 >
 > ```bash
-> sudo cp "$(go env GOPATH)/bin/spank" /usr/local/bin/spank
+> sudo cp "$(go env GOPATH)/bin/nina" /usr/local/bin/nina
 > ```
 
 ## 使用方法
 
 ```bash
 # 普通模式 — 拍打时说"ow!"
-sudo spank
+sudo nina
 
 # 性感模式 — 根据拍打频率升级回应
-sudo spank --sexy
+sudo nina --sexy
 
 # 光环模式 — 拍打时播放光环死亡音效
-sudo spank --halo
+sudo nina --halo
 
 # 快速模式 — 更快的轮询和更短的冷却时间
-sudo spank --fast
-sudo spank --sexy --fast
+sudo nina --fast
+sudo nina --sexy --fast
 
 # 自定义模式 — 从指定目录播放你自己的 MP3 文件
-sudo spank --custom /path/to/mp3s
+sudo nina --custom /path/to/mp3s
 
 # 使用振幅阈值调整灵敏度（数值越低越敏感）
-sudo spank --min-amplitude 0.1   # 更敏感
-sudo spank --min-amplitude 0.25  # 不太敏感
-sudo spank --sexy --min-amplitude 0.2
+sudo nina --min-amplitude 0.1   # 更敏感
+sudo nina --min-amplitude 0.25  # 不太敏感
+sudo nina --sexy --min-amplitude 0.2
 
 # 设置冷却时间（毫秒，默认：750）
-sudo spank --cooldown 600
+sudo nina --cooldown 600
 
 # 设置播放速度倍数（默认：1.0）
-sudo spank --speed 0.7   # 更慢更深沉
-sudo spank --speed 1.5   # 更快
-sudo spank --sexy --speed 0.6
+sudo nina --speed 0.7   # 更慢更深沉
+sudo nina --speed 1.5   # 更快
+sudo nina --sexy --speed 0.6
 ```
 
 ### 模式
@@ -95,32 +95,32 @@ sudo spank --sexy --speed 0.6
 
 ## 作为服务运行
 
-要让 spank 在启动时自动运行，请创建一个`系统守护进程`配置文件。选择运行模式，如下：
+要让 nina 在启动时自动运行，请创建一个`系统守护进程`配置文件。选择运行模式，如下：
 
 <details>
 <summary>疼痛模式（默认）</summary>
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.taigrr.nina.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.taigrr.spank</string>
+    <string>com.taigrr.nina</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spank</string>
+        <string>/usr/local/bin/nina</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
+    <string>/tmp/nina.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
+    <string>/tmp/nina.err</string>
 </dict>
 </plist>
 EOF
@@ -132,17 +132,17 @@ EOF
 <summary>性感模式</summary>
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.taigrr.nina.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.taigrr.spank</string>
+    <string>com.taigrr.nina</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spank</string>
+        <string>/usr/local/bin/nina</string>
         <string>--sexy</string>
     </array>
     <key>RunAtLoad</key>
@@ -150,9 +150,9 @@ sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
+    <string>/tmp/nina.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
+    <string>/tmp/nina.err</string>
 </dict>
 </plist>
 EOF
@@ -164,17 +164,17 @@ EOF
 <summary>光环模式</summary>
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.taigrr.nina.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.taigrr.spank</string>
+    <string>com.taigrr.nina</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spank</string>
+        <string>/usr/local/bin/nina</string>
         <string>--halo</string>
     </array>
     <key>RunAtLoad</key>
@@ -182,9 +182,9 @@ sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
+    <string>/tmp/nina.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
+    <string>/tmp/nina.err</string>
 </dict>
 </plist>
 EOF
@@ -192,12 +192,12 @@ EOF
 
 </details>
 
-> **注意：** 如果你将 spank 安装在其他位置（例如 `~/go/bin/spank`），请更新 spank 的路径。
+> **注意：** 如果你将 nina 安装在其他位置（例如 `~/go/bin/nina`），请更新 nina 的路径。
 
 加载并启动服务：
 
 ```bash
-sudo launchctl load /Library/LaunchDaemons/com.taigrr.spank.plist
+sudo launchctl load /Library/LaunchDaemons/com.taigrr.nina.plist
 ```
 
 由于 `plist` 文件位于 `/Library/LaunchDaemons` 且未设置 `UserName` ，`launchctl` 命令会以 root 身份运行它， 所以不需要加 `sudo`。
@@ -205,7 +205,7 @@ sudo launchctl load /Library/LaunchDaemons/com.taigrr.spank.plist
 要停止或卸载：
 
 ```bash
-sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
+sudo launchctl unload /Library/LaunchDaemons/com.taigrr.nina.plist
 ```
 
 ## 工作原理
@@ -219,7 +219,7 @@ sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=taigrr/spank&type=date&legend=top-left)](https://www.star-history.com/#taigrr/spank&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=taigrr/nina&type=date&legend=top-left)](https://www.star-history.com/#taigrr/nina&type=date&legend=top-left)
 
 ## 致谢
 

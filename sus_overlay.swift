@@ -46,7 +46,7 @@ class OverlayWindow: NSWindow {
         let newX = newOrigin.x + (event.locationInWindow.x - lastLocation.x)
         let newY = newOrigin.y + (event.locationInWindow.y - lastLocation.y)
         self.setFrameOrigin(NSPoint(x: newX, y: newY))
-        updateView() // Update mirroring while dragging
+        updateView() // Update mirroring live while dragging
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -57,15 +57,27 @@ class OverlayWindow: NSWindow {
 
 let app = NSApplication.shared
 let window = OverlayWindow()
-let contentView = window.contentView!
-let imageView = NSImageView(frame: contentView.bounds)
+let imageView = NSImageView(frame: window.contentView!.bounds)
 imageView.imageScaling = .scaleProportionallyUpOrDown
 imageView.wantsLayer = true
-if let layer = imageView.layer {
-    layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-    layer.frame = contentView.bounds
-}
-contentView.addSubview(imageView)
+window.contentView?.addSubview(imageView)
+
+// Thought Label (Glassmorphic Bubble)
+let thoughtLabel = NSTextField(frame: NSRect(x: 10, y: 155, width: 180, height: 40))
+thoughtLabel.isEditable = false
+thoughtLabel.isBordered = false
+thoughtLabel.isBezeled = false
+thoughtLabel.drawsBackground = true
+thoughtLabel.backgroundColor = NSColor.black.withAlphaComponent(0.6)
+thoughtLabel.textColor = .white
+thoughtLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+thoughtLabel.alignment = .center
+thoughtLabel.lineBreakMode = .byWordWrapping
+thoughtLabel.wantsLayer = true
+thoughtLabel.layer?.cornerRadius = 8
+thoughtLabel.isHidden = true
+window.contentView?.addSubview(thoughtLabel)
+
 window.makeKeyAndOrderFront(nil)
 
 let args = CommandLine.arguments
@@ -75,40 +87,116 @@ var currentLevel = 1
 var currentIdle = 1
 var lastSlapTime = Date()
 var lastIdleChange = Date()
+var currentContextTag = "mode_unknown"
+var currentContextMood = ""
+var currentContextThought = ""
+var lastThoughtUpdate = Date()
 
 func updateView() {
-    let screen = window.screen ?? NSScreen.main
-    let screenRect = screen?.frame ?? NSRect.zero
+    let screenRect = NSScreen.main?.frame ?? NSScreen.screens.first?.frame ?? .zero
     let windowCenterX = window.frame.midX
     let shouldMirror = windowCenterX > screenRect.midX
     
     DispatchQueue.main.async {
-        if let layer = imageView.layer {
-            // Use a stable transform: reset to identity, then flip across the midline if needed
-            if shouldMirror {
-                // Translation-Scale-Translation to flip across the 100px vertical center
-                var transform = CATransform3DMakeTranslation(200, 0, 0)
-                transform = CATransform3DScale(transform, -1, 1, 1)
-                layer.transform = transform
-            } else {
-                layer.transform = CATransform3DIdentity
+        // Ensure the image view fills the window
+        imageView.frame = window.contentView?.bounds ?? .zero
+        
+        let transform: CATransform3D
+        if shouldMirror {
+            // Flip around the center of the image view
+            let centerX = imageView.bounds.midX
+            var t = CATransform3DIdentity
+            t = CATransform3DTranslate(t, centerX, 0, 0)
+            t = CATransform3DScale(t, -1, 1, 1)
+            t = CATransform3DTranslate(t, -centerX, 0, 0)
+            transform = t
+        } else {
+            transform = CATransform3DIdentity
+        }
+        
+        imageView.layer?.transform = transform
+        
+        // Update thought bubble
+        if currentContextThought.isEmpty || currentContextTag == "mode_unknown" {
+            thoughtLabel.isHidden = true
+        } else {
+            thoughtLabel.stringValue = currentContextThought
+            thoughtLabel.isHidden = false
+            lastThoughtUpdate = Date() // Reset the 'timer' anchor
+            
+            // Subtle fade-in
+            thoughtLabel.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.5
+                thoughtLabel.animator().alphaValue = 0.8 // Reaching a slightly transparent peak
+            }
+        }
+        
+        if window.dragging {
+            loadGrabbedImage()
+        } else {
+            if !loadContextImage(tag: currentContextTag) {
+                loadImage(level: currentLevel)
             }
         }
     }
+}
 
-    if window.dragging {
-        loadGrabbedImage()
-    } else {
-        loadImage(level: currentLevel)
+func loadContextImage(tag: String) -> Bool {
+    let cleanTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+    if cleanTag.isEmpty || cleanTag == "mode_unknown" {
+        return false
+    }
+
+    // --- COIN FLIP LOGIC ---
+    let variant = Bool.random() ? "1" : "2"
+    let variantTag = "\(cleanTag)_\(variant)"
+    
+    // Check for the randomized variant first (e.g., mode_focus_1.png)
+    let variantGif = "\(assetDir)/\(variantTag).gif"
+    let variantPng = "\(assetDir)/\(variantTag).png"
+    
+    // Also check for the base tag (e.g., mode_focus.png) as a fallback
+    let baseGif = "\(assetDir)/\(cleanTag).gif"
+    let basePng = "\(assetDir)/\(cleanTag).png"
+    
+    var candidatePaths: [String] = [variantGif, variantPng, baseGif, basePng]
+
+    for base in contextFallbackBaseNames(tag: cleanTag) {
+        candidatePaths.append("\(assetDir)/\(base).gif")
+        candidatePaths.append("\(assetDir)/\(base).png")
+    }
+
+    for p in candidatePaths where FileManager.default.fileExists(atPath: p) {
+        if let img = NSImage(contentsOfFile: p) {
+            imageView.image = img
+            return true
+        }
+    }
+    return false
+}
+
+func contextFallbackBaseNames(tag: String) -> [String] {
+    switch tag {
+    case "mode_focus":
+        return ["2", "1", "0_1"]
+    case "mode_chill":
+        return ["0_2", "0_1", "1"]
+    case "mode_game":
+        return ["3", "2", "1"]
+    case "mode_music":
+        return ["0_3", "0_2", "1"]
+    case "mode_shame":
+        return ["4", "2", "1"]
+    default:
+        return []
     }
 }
 
 func loadGrabbedImage() {
     let path = "\(assetDir)/grabbed.png"
     if let img = NSImage(contentsOfFile: path) {
-        DispatchQueue.main.async {
-            imageView.image = img
-        }
+        imageView.image = img
     } else {
         // Fallback to current level if grabbed photo is missing
         loadImage(level: currentLevel)
@@ -116,24 +204,26 @@ func loadGrabbedImage() {
 }
 
 func loadImage(level: Int) {
-    var path = "\(assetDir)/\(level).png"
+    var baseName = "\(level)"
     if level == 0 {
-        path = "\(assetDir)/0_\(currentIdle).png"
+        baseName = "0_\(currentIdle)"
     }
     
-    // Fallback if that specific idle doesn't exist
-    if level == 0 && !FileManager.default.fileExists(atPath: path) {
+    let gifPath = "\(assetDir)/\(baseName).gif"
+    let pngPath = "\(assetDir)/\(baseName).png"
+    
+    var finalPath = pngPath
+    if FileManager.default.fileExists(atPath: gifPath) {
+        finalPath = gifPath
+    } else if level == 0 && !FileManager.default.fileExists(atPath: pngPath) {
         currentIdle = 1
-        path = "\(assetDir)/0_\(currentIdle).png"
+        finalPath = "\(assetDir)/0_1.png"
     }
 
-    if let img = NSImage(contentsOfFile: path) {
-        DispatchQueue.main.async {
-            imageView.image = img
-        }
+    if let img = NSImage(contentsOfFile: finalPath) {
+        imageView.image = img
     } else {
-        // As a final fallback if 0_1 doesn't exist either, just clear
-        DispatchQueue.main.async { imageView.image = nil }
+        imageView.image = nil
     }
 }
 
@@ -164,6 +254,18 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
             nextIdle()
         }
     }
+    
+    // Auto-fade thought bubble after 10 seconds
+    if !thoughtLabel.isHidden && now.timeIntervalSince(lastThoughtUpdate) > 10.0 {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 1.0
+            thoughtLabel.animator().alphaValue = 0
+        } completionHandler: {
+            if Date().timeIntervalSince(lastThoughtUpdate) >= 11.0 { // Verification to avoid race
+                thoughtLabel.isHidden = true
+            }
+        }
+    }
 }
 
 DispatchQueue.global().async {
@@ -171,6 +273,32 @@ DispatchQueue.global().async {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed == "quit" {
             exit(0)
+        }
+        if let data = trimmed.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let kind = obj["type"] as? String {
+            if kind == "slap" {
+                if let level = obj["level"] as? Int {
+                    DispatchQueue.main.async {
+                        currentLevel = level
+                        lastSlapTime = Date()
+                        updateView()
+                    }
+                    continue
+                }
+            }
+            if kind == "context" {
+                let tag = (obj["tag"] as? String) ?? "mode_unknown"
+                let mood = (obj["mood"] as? String) ?? ""
+                let thought = (obj["thought"] as? String) ?? ""
+                DispatchQueue.main.async {
+                    currentContextTag = tag
+                    currentContextMood = mood
+                    currentContextThought = thought
+                    updateView()
+                }
+                continue
+            }
         }
         if let level = Int(trimmed) {
             DispatchQueue.main.async {

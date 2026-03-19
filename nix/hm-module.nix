@@ -3,18 +3,18 @@ flake:
 { config, lib, pkgs, ... }:
 
 let
-  cfg = config.programs.spank;
-  spankPkg = flake.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  cfg = config.programs.nina;
+  ninaPkg = flake.packages.${pkgs.stdenv.hostPlatform.system}.default;
 in
 {
-  options.programs.spank = {
-    enable = lib.mkEnableOption "spank - yells when you slap the laptop";
+  options.programs.nina = {
+    enable = lib.mkEnableOption "nina - yells when you slap the laptop";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = spankPkg;
-      defaultText = lib.literalExpression "inputs.spank.packages.\${system}.default";
-      description = "The spank package to use.";
+      default = ninaPkg;
+      defaultText = lib.literalExpression "inputs.nina.packages.\${system}.default";
+      description = "The nina package to use.";
     };
 
     mode = lib.mkOption {

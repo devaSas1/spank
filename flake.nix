@@ -1,5 +1,5 @@
 {
-  description = "spank - Yells 'ow!' when you slap the laptop";
+  description = "nina - Yells 'ow!' when you slap the laptop";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

@@ -1,7 +1,7 @@
 { lib, buildGoModule, go_1_26 }:
 
 buildGoModule.override { go = go_1_26; } {
-  pname = "spank";
+  pname = "nina";
   version = "0-unstable";
 
   src = lib.cleanSource ./..;
@@ -16,9 +16,9 @@ buildGoModule.override { go = go_1_26; } {
 
   meta = {
     description = "Yells 'ow!' when you slap the laptop";
-    homepage = "https://github.com/taigrr/spank";
+    homepage = "https://github.com/taigrr/nina";
     license = lib.licenses.mit;
     platforms = [ "aarch64-darwin" ];
-    mainProgram = "spank";
+    mainProgram = "nina";
   };
 }

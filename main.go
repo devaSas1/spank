@@ -39,13 +39,13 @@ import (
 
 var version = "dev"
 
-//go:embed audio/pain/*.mp3
+//go:embed audio/pain
 var painAudio embed.FS
 
-//go:embed audio/sexy/*.mp3
+//go:embed audio/sexy
 var sexyAudio embed.FS
 
-//go:embed audio/halo/*.mp3
+//go:embed audio/halo
 var haloAudio embed.FS
 
 var (
@@ -62,6 +62,7 @@ var (
 	audioBackend    string
 	outputVolume    float64
 	feedbackGuardMs int
+	memoryDBPath    string
 	minAmplitude    float64
 	cooldownMs      int
 	stdioMode       bool
@@ -211,7 +212,10 @@ func (sp *soundPack) loadFiles() error {
 		sp.files = make([]string, 0, len(entries))
 		for _, entry := range entries {
 			if !entry.IsDir() {
-				sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+				ext := strings.ToLower(filepath.Ext(entry.Name()))
+				if ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".mov" || ext == ".aac" {
+					sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+				}
 			}
 		}
 	} else {
@@ -222,7 +226,10 @@ func (sp *soundPack) loadFiles() error {
 		sp.files = make([]string, 0, len(entries))
 		for _, entry := range entries {
 			if !entry.IsDir() {
-				sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+				ext := strings.ToLower(filepath.Ext(entry.Name()))
+				if ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".mov" || ext == ".aac" {
+					sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+				}
 			}
 		}
 	}
@@ -298,7 +305,7 @@ func (st *slapTracker) record(now time.Time, amplitude float64) (int, float64) {
 		st.susSlaps = valid
 
 		st.total++
-		
+
 		count := len(st.susSlaps)
 		if count >= 10 || amplitude > 0.8 {
 			st.susLevel = 4 // Yamete
@@ -438,6 +445,24 @@ func (st *slapTracker) rememberIdx(idx int) {
 }
 
 func main() {
+	// Load .env if it exists
+	if f, err := os.Open(".env"); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				os.Setenv(key, val)
+			}
+		}
+		f.Close()
+	}
+
 	cmd := &cobra.Command{
 		Use:   "nina",
 		Short: "A desktop catgirl that reacts to sound",
@@ -483,6 +508,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 	cmd.Flags().IntVar(&feedbackGuardMs, "feedback-guard", defaultFeedbackGuardMs, "Extra mic-only suppression window in ms to reduce speaker self-trigger")
+	cmd.Flags().StringVar(&memoryDBPath, "memory-db", "nina_memory.db", "Path to Nina memory SQLite database")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
 	cmd.Flags().Float64Var(&outputVolume, "output-volume", defaultOutputVolume, "Master playback volume cap (0.0-1.0)")
@@ -495,7 +521,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 
 func run(ctx context.Context, tuning runtimeTuning) error {
 	if !micMode && os.Geteuid() != 0 {
-		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
+		return fmt.Errorf("nina requires root privileges for accelerometer access, run with: sudo nina")
 	}
 
 	modeCount := 0
@@ -598,12 +624,12 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		cmdOverlay := exec.Command("swift", "sus_overlay.swift", pack.dir+"/visual")
 		stdin, err := cmdOverlay.StdinPipe()
 		if err != nil {
-			fmt.Printf("spank warning: could not pipe to overlay: %v\n", err)
+			fmt.Printf("nina warning: could not pipe to overlay: %v\n", err)
 		} else {
 			overlayStdin = stdin
 			if stdout, err := cmdOverlay.StdoutPipe(); err == nil {
 				if err := cmdOverlay.Start(); err != nil {
-					fmt.Printf("spank warning: could not start overlay: %v\n", err)
+					fmt.Printf("nina warning: could not start overlay: %v\n", err)
 				} else {
 					defer func() {
 						stdin.Close()
@@ -628,6 +654,11 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 				cmdOverlay.Stdout = os.Stdout
 				_ = cmdOverlay.Start()
 			}
+		}
+	}
+	if susMode {
+		if err := startNinaSoul(ctx, overlayStdin); err != nil {
+			fmt.Printf("nina warning: soul engine disabled: %v\n", err)
 		}
 	}
 
@@ -725,7 +756,7 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 	if strictMode {
 		classifierLabel = "strict"
 	}
-	fmt.Printf("spank: listening for slaps in %s mode with %s tuning (input=mic classifier=%s)... (ctrl+c to quit)\n", pack.name, presetLabel, classifierLabel)
+	fmt.Printf("nina: listening for slaps in %s mode with %s tuning (input=mic classifier=%s)... (ctrl+c to quit)\n", pack.name, presetLabel, classifierLabel)
 	if stdioMode {
 		fmt.Println(`{"status":"ready"}`)
 	}
@@ -784,9 +815,7 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 		lastYell = now
 		num, score := tracker.record(now, amplitude)
 		file, level := tracker.getFile(score)
-		if overlayStdin != nil && level > 0 {
-			fmt.Fprintf(overlayStdin, "%d\n", level)
-		}
+		sendOverlaySlapLevel(overlayStdin, level)
 		if stdioMode {
 			event := map[string]interface{}{
 				"timestamp":  now.Format(time.RFC3339Nano),
@@ -933,7 +962,7 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 	if fastMode {
 		presetLabel = "fast"
 	}
-	fmt.Printf("spank: listening for slaps in %s mode with %s tuning... (ctrl+c to quit)\n", pack.name, presetLabel)
+	fmt.Printf("nina: listening for slaps in %s mode with %s tuning... (ctrl+c to quit)\n", pack.name, presetLabel)
 	if stdioMode {
 		fmt.Println(`{"status":"ready"}`)
 	}
@@ -994,9 +1023,7 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		lastYell = now
 		num, score := tracker.record(now, ev.Amplitude)
 		file, level := tracker.getFile(score)
-		if overlayStdin != nil && level > 0 {
-			fmt.Fprintf(overlayStdin, "%d\n", level)
-		}
+		sendOverlaySlapLevel(overlayStdin, level)
 		if stdioMode {
 			event := map[string]interface{}{
 				"timestamp":  now.Format(time.RFC3339Nano),
@@ -1111,7 +1138,7 @@ func resolveAfplayPath(pack *soundPack, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read embedded audio %s: %w", path, err)
 	}
-	tmp, err := os.CreateTemp("", "spank-audio-*.mp3")
+	tmp, err := os.CreateTemp("", "nina-audio-*.mp3")
 	if err != nil {
 		return "", fmt.Errorf("create temp audio: %w", err)
 	}
@@ -1181,13 +1208,13 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 	if pack.custom {
 		file, err := os.Open(path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: open %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "nina: open %s: %v\n", path, err)
 			return
 		}
 		streamer, format, err = mp3.Decode(file)
 		if err != nil {
 			_ = file.Close()
-			fmt.Fprintf(os.Stderr, "spank: decode %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "nina: decode %s: %v\n", path, err)
 			return
 		}
 		closePlayback = func() {
@@ -1199,12 +1226,12 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 	} else {
 		data, err := pack.fs.ReadFile(path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: read %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "nina: read %s: %v\n", path, err)
 			return
 		}
 		streamer, format, err = mp3.Decode(io.NopCloser(bytes.NewReader(data)))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: decode %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "nina: decode %s: %v\n", path, err)
 			return
 		}
 		closePlayback = func() {
@@ -1227,7 +1254,7 @@ func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *boo
 		if err := speaker.Init(format.SampleRate, format.SampleRate.N(speakerBufferDuration())); err != nil {
 			speakerMu.Unlock()
 			closePlayback()
-			fmt.Fprintf(os.Stderr, "spank: speaker init failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "nina: speaker init failed: %v\n", err)
 			return
 		}
 		*speakerInit = true

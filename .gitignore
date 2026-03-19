@@ -1,7 +1,14 @@
-/spank
-dist/
-*.log
-.crush
-spank.test
-result
-.vscode/
+# API Keys & Env
+.env
+.env.local
+
+# Databases & Memory
+nina_memory.db
+nina_memory.db-journal
+nina_memory.db-wal
+nina_diary.json
+
+# Binaries & OS files
+nina
+sus_overlay
+.DS_Store

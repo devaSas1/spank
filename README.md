@@ -1,4 +1,4 @@
-# spank
+# nina
 
 **English** | [简体中文][readme-zh-link]
 
@@ -21,63 +21,88 @@ Uses either the Apple Silicon accelerometer (IOKit HID) or microphone transients
 
 ## Install
 
-Download from the [latest release](https://github.com/taigrr/spank/releases/latest).
+Download from the [latest release](https://github.com/taigrr/nina/releases/latest).
 
 Or build from source:
 
 ```bash
-go install github.com/taigrr/spank@latest
+go install github.com/taigrr/nina@latest
 ```
 
-> **Note:** `go install` places the binary in `$GOBIN` (if set) or `$(go env GOPATH)/bin` (which defaults to `~/go/bin`). Copy it to a system path so `sudo spank` works. For example, with the default Go settings:
+> **Note:** `go install` places the binary in `$GOBIN` (if set) or `$(go env GOPATH)/bin` (which defaults to `~/go/bin`). Copy it to a system path so `sudo nina` works. For example, with the default Go settings:
 >
 > ```bash
-> sudo cp "$(go env GOPATH)/bin/spank" /usr/local/bin/spank
+> sudo cp "$(go env GOPATH)/bin/nina" /usr/local/bin/nina
 > ```
 
 ## Usage
 
 ```bash
 # Normal mode — says "ow!" when slapped
-sudo spank
+sudo nina
 
 # M1-friendly mode — microphone transient detection (no sudo)
-spank --mic
-spank --mic --mic-device 1   # choose a different input device index
-spank --mic --mic-device 1 --strict  # reject most voice/scream triggers
+nina --mic
+nina --mic --mic-device 1   # choose a different input device index
+nina --mic --mic-device 1 --strict  # reject most voice/scream triggers
 
 # Sexy mode — escalating responses based on slap frequency
-sudo spank --sexy
-spank --mic --sexy
+sudo nina --sexy
+nina --mic --sexy
 
 # Halo mode — plays Halo death sounds when slapped
-sudo spank --halo
-spank --mic --halo
+sudo nina --halo
+nina --mic --halo
 
 # Fast mode — faster polling and shorter cooldown
-sudo spank --fast
-sudo spank --sexy --fast
+sudo nina --fast
+sudo nina --sexy --fast
 
 # Custom mode — plays your own MP3 files from a directory
-sudo spank --custom /path/to/mp3s
+sudo nina --custom /path/to/mp3s
 
 # Adjust sensitivity with amplitude threshold (lower = more sensitive)
-sudo spank --min-amplitude 0.1   # more sensitive
-sudo spank --min-amplitude 0.25  # less sensitive
-sudo spank --sexy --min-amplitude 0.2
+sudo nina --min-amplitude 0.1   # more sensitive
+sudo nina --min-amplitude 0.25  # less sensitive
+sudo nina --sexy --min-amplitude 0.2
 
 # Set cooldown period in millisecond (default: 750)
-sudo spank --cooldown 600
+sudo nina --cooldown 600
 
 # Set playback speed multiplier (default: 1.0)
-sudo spank --speed 0.7   # slower and deeper
-sudo spank --speed 1.5   # faster
-sudo spank --sexy --speed 0.6
+sudo nina --speed 0.7   # slower and deeper
+sudo nina --speed 1.5   # faster
+sudo nina --sexy --speed 0.6
 
 # If mic mode is too sensitive, increase threshold
-spank --mic --min-amplitude 0.08
-spank --mic --strict --min-amplitude 0.07 --cooldown 700
+nina --mic --min-amplitude 0.08
+nina --mic --strict --min-amplitude 0.07 --cooldown 700
+
+# Nina 2.0 companion mode (single-command run)
+GOOGLE_API_KEY=your_key_here nina --mic --sus --mic-device 1
 ```
+
+### Nina 2.0 (Context Companion in `--sus` mode)
+
+- Starts a background vision loop and memory engine automatically when `--sus` is enabled.
+- Uses local SQLite memory at `nina_memory.db` (override with `--memory-db /path/to.db`).
+- Uses local guardrails + Gemini 1.5 Flash (`GOOGLE_API_KEY`) for context tagging/thoughts.
+- If API is unavailable, Nina continues with local classification (no crash).
+
+macOS permissions needed for full Nina 2.0 behavior:
+
+- **Microphone**: for `--mic`.
+- **Screen Recording**: for screenshot-based context analysis.
+- **Automation/Accessibility (System Events)**: to read active app/window metadata.
+
+Context tags used for sprite routing:
+
+- `mode_focus`
+- `mode_chill`
+- `mode_game`
+- `mode_music`
+- `mode_shame`
+- `mode_unknown`
 
 ### Modes
 
@@ -121,32 +146,32 @@ In strict mic mode, start around `0.06-0.09` and tune from there.
 
 ## Running as a Service
 
-To have spank start automatically at boot, create a launchd plist. Pick your mode:
+To have nina start automatically at boot, create a launchd plist. Pick your mode:
 
 <details>
 <summary>Pain mode (default)</summary>
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.taigrr.nina.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.taigrr.spank</string>
+    <string>com.taigrr.nina</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spank</string>
+        <string>/usr/local/bin/nina</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
+    <string>/tmp/nina.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
+    <string>/tmp/nina.err</string>
 </dict>
 </plist>
 EOF
@@ -158,17 +183,17 @@ EOF
 <summary>Sexy mode</summary>
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.taigrr.nina.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.taigrr.spank</string>
+    <string>com.taigrr.nina</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spank</string>
+        <string>/usr/local/bin/nina</string>
         <string>--sexy</string>
     </array>
     <key>RunAtLoad</key>
@@ -176,9 +201,9 @@ sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
+    <string>/tmp/nina.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
+    <string>/tmp/nina.err</string>
 </dict>
 </plist>
 EOF
@@ -190,17 +215,17 @@ EOF
 <summary>Halo mode</summary>
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.taigrr.nina.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.taigrr.spank</string>
+    <string>com.taigrr.nina</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spank</string>
+        <string>/usr/local/bin/nina</string>
         <string>--halo</string>
     </array>
     <key>RunAtLoad</key>
@@ -208,9 +233,9 @@ sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
+    <string>/tmp/nina.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
+    <string>/tmp/nina.err</string>
 </dict>
 </plist>
 EOF
@@ -218,12 +243,12 @@ EOF
 
 </details>
 
-> **Note:** Update the path to `spank` if you installed it elsewhere (e.g. `~/go/bin/spank`).
+> **Note:** Update the path to `nina` if you installed it elsewhere (e.g. `~/go/bin/nina`).
 
 Load and start the service:
 
 ```bash
-sudo launchctl load /Library/LaunchDaemons/com.taigrr.spank.plist
+sudo launchctl load /Library/LaunchDaemons/com.taigrr.nina.plist
 ```
 
 Since the plist lives in `/Library/LaunchDaemons` and no `UserName` key is set, launchd runs it as root — no `sudo` needed.
@@ -231,7 +256,7 @@ Since the plist lives in `/Library/LaunchDaemons` and no `UserName` key is set, 
 To stop or unload:
 
 ```bash
-sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
+sudo launchctl unload /Library/LaunchDaemons/com.taigrr.nina.plist
 ```
 
 ## How it works
@@ -245,7 +270,7 @@ sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=taigrr/spank&type=date&legend=top-left)](https://www.star-history.com/#taigrr/spank&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=taigrr/nina&type=date&legend=top-left)](https://www.star-history.com/#taigrr/nina&type=date&legend=top-left)
 
 ## Credits
 
