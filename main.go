@@ -49,27 +49,29 @@ var sexyAudio embed.FS
 var haloAudio embed.FS
 
 var (
-	sexyMode        bool
-	haloMode        bool
-	susMode         bool
-	customPath      string
-	customFiles     []string
-	micMode         bool
-	micDevice       string
-	strictMode      bool
-	fastMode        bool
-	cutOnSlap       bool
-	audioBackend    string
-	outputVolume    float64
-	feedbackGuardMs int
-	memoryDBPath    string
-	minAmplitude    float64
-	cooldownMs      int
-	stdioMode       bool
-	volumeScaling   bool
-	paused          bool
-	pausedMu        sync.RWMutex
-	speedRatio      float64
+	sexyMode         bool
+	haloMode         bool
+	susMode          bool
+	customPath       string
+	customFiles      []string
+	micMode          bool
+	micDevice        string
+	strictMode       bool
+	fastMode         bool
+	cutOnSlap        bool
+	audioBackend     string
+	outputVolume     float64
+	feedbackGuardMs  int
+	memoryDBPath     string
+	geminiModel      string
+	geminiEmbedModel string
+	minAmplitude     float64
+	cooldownMs       int
+	stdioMode        bool
+	volumeScaling    bool
+	paused           bool
+	pausedMu         sync.RWMutex
+	speedRatio       float64
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -457,10 +459,23 @@ func main() {
 			if len(parts) == 2 {
 				key := strings.TrimSpace(parts[0])
 				val := strings.TrimSpace(parts[1])
+				val = strings.Trim(val, `"'`) // Remove any double or single quotes
 				os.Setenv(key, val)
 			}
 		}
 		f.Close()
+
+		// DEBUG: Let the user know what was loaded
+		key := os.Getenv("GOOGLE_API_KEY")
+		if key != "" {
+			masked := "empty"
+			if len(key) > 8 {
+				masked = key[:4] + "..." + key[len(key)-4:]
+			}
+			fmt.Printf("[NINA STARTUP] + Loaded GOOGLE_API_KEY from .env (len=%d): %s\n", len(key), masked)
+		} else {
+			fmt.Printf("[NINA STARTUP] X GOOGLE_API_KEY NOT FOUND in .env\n")
+		}
 	}
 
 	cmd := &cobra.Command{
@@ -489,9 +504,21 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 			if cmd.Flags().Changed("cooldown") {
 				tuning.cooldown = time.Duration(cooldownMs) * time.Millisecond
 			}
+			// Keep runtime globals aligned with resolved tuning.
+			minAmplitude = tuning.minAmplitude
+			cooldownMs = int(tuning.cooldown / time.Millisecond)
 			return run(cmd.Context(), tuning)
 		},
 		SilenceUsage: true,
+	}
+
+	defaultGeminiModelFlag := strings.TrimSpace(os.Getenv("NINA_GEMINI_MODEL"))
+	if defaultGeminiModelFlag == "" {
+		defaultGeminiModelFlag = defaultGeminiModel
+	}
+	defaultGeminiEmbedModelFlag := strings.TrimSpace(os.Getenv("NINA_GEMINI_EMBED_MODEL"))
+	if defaultGeminiEmbedModelFlag == "" {
+		defaultGeminiEmbedModelFlag = defaultGeminiEmbeddingModel
 	}
 
 	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
@@ -513,6 +540,8 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
 	cmd.Flags().Float64Var(&outputVolume, "output-volume", defaultOutputVolume, "Master playback volume cap (0.0-1.0)")
 	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
+	cmd.Flags().StringVar(&geminiModel, "gemini-model", defaultGeminiModelFlag, "Gemini model for Nina soul (default: lowest-cost stable model)")
+	cmd.Flags().StringVar(&geminiEmbedModel, "gemini-embed-model", defaultGeminiEmbedModelFlag, "Gemini embedding model for Nina memory retrieval")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -577,10 +606,31 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		}
 		// Overlap sounds by default in sus mode
 		cutOnSlap = false
-		// Drop cooldown significantly to allow "rapid fire"
-		if tuning.cooldown == time.Duration(defaultCooldownMs)*time.Millisecond {
-			tuning.cooldown = 180 * time.Millisecond
-			cooldownMs = 180
+		if micMode {
+			// In mic mode, be conservative to avoid ambient-noise spam.
+			if !strictMode {
+				strictMode = true
+				fmt.Println("nina: sus+mic auto-enabled strict classifier to reduce false triggers")
+			}
+			if minAmplitude <= defaultMinAmplitude {
+				minAmplitude = 0.12
+				tuning.minAmplitude = minAmplitude
+				fmt.Printf("nina: sus+mic auto-raised min amplitude to %.2f\n", minAmplitude)
+			}
+			if tuning.cooldown == time.Duration(defaultCooldownMs)*time.Millisecond {
+				tuning.cooldown = 600 * time.Millisecond
+				cooldownMs = 600
+				fmt.Println("nina: sus+mic auto-raised cooldown to 600ms")
+			}
+			if feedbackGuardMs < 450 {
+				feedbackGuardMs = 450
+			}
+		} else {
+			// Drop cooldown significantly for accelerometer-only rapid fire.
+			if tuning.cooldown == time.Duration(defaultCooldownMs)*time.Millisecond {
+				tuning.cooldown = 180 * time.Millisecond
+				cooldownMs = 180
+			}
 		}
 	}
 
@@ -757,6 +807,7 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 		classifierLabel = "strict"
 	}
 	fmt.Printf("nina: listening for slaps in %s mode with %s tuning (input=mic classifier=%s)... (ctrl+c to quit)\n", pack.name, presetLabel, classifierLabel)
+	fmt.Printf("nina: mic settings device=%s min_amp=%.3f cooldown=%dms feedback_guard=%dms\n", micDevice, minAmplitude, cooldownMs, feedbackGuardMs)
 	if stdioMode {
 		fmt.Println(`{"status":"ready"}`)
 	}
@@ -1441,4 +1492,30 @@ func printSusReaction(score float64) {
 `
 	}
 	fmt.Println(sprite)
+}
+func loadDotEnv() {
+	f, err := os.Open(".env")
+	if err != nil {
+		return // Silent fail if file doesn't exist
+	}
+	defer f.Close()
+
+	if abs, err := filepath.Abs(".env"); err == nil {
+		fmt.Printf("[NINA STARTUP] + Found .env at: %s\n", abs)
+	}
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			// Strip quotes if present
+			val = strings.Trim(val, `"'`)
+			os.Setenv(key, val)
+		}
+	}
 }

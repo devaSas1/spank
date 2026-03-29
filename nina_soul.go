@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"math"
 	"net/http"
@@ -22,13 +21,23 @@ import (
 )
 
 const (
-	visionCycleInterval      = 5 * time.Minute
-	geminiMinimumCallSpacing = 15 * time.Minute
-	guardPollInterval        = 1 * time.Second
-	shameHoldDuration        = 15 * time.Minute
-	reflectionInterval       = 24 * time.Hour
-	maxSemanticCandidates    = 5000
-	embeddingDims            = 256
+	visionCycleInterval          = 5 * time.Minute
+	geminiMinimumCallSpacing     = 4 * time.Minute
+	defaultGeminiModel           = "gemini-2.5-flash-lite"
+	fallbackGeminiModel          = "gemini-2.5-flash"
+	defaultGeminiEmbeddingModel  = "gemini-embedding-001"
+	fallbackGeminiEmbeddingModel = "gemini-embedding-2-preview"
+	visionThoughtRetryAttempts   = 2
+	minThoughtWords              = 8
+	maxThoughtWords              = 20
+	guardPollInterval            = 1 * time.Second
+	shameHoldDuration            = 15 * time.Minute
+	leisureGraceDuration         = 20 * time.Minute
+	leisureNudgeDuration         = 40 * time.Minute
+	focusBreakSuggestDuration    = 70 * time.Minute
+	focusBreakStrongDuration     = 105 * time.Minute
+	reflectionInterval           = 24 * time.Hour
+	maxSemanticCandidates        = 5000
 )
 
 var (
@@ -48,14 +57,35 @@ var (
 		"vscode", "xcode", "goland", "cursor", "terminal", "iterm", "warp",
 		"docs", "notion", "obsidian", "github", "stackoverflow",
 	}
+	focusAppKeywords = []string{
+		"notion", "obsidian", "anki", "endel", "forest", "cold turkey",
+		"todoist", "ticktick", "linear", "jira", "figma", "miro", "logseq",
+		"craft", "slack", "discord", "readwise", "raycast",
+	}
+	devAppKeywords = []string{
+		"cursor", "code", "visual studio code", "xcode", "goland", "jetbrains",
+		"terminal", "iterm", "warp", "kitty", "zed", "neovim", "vim", "emacs",
+		"windsurf", "sublime text",
+	}
 	chillKeywords = []string{
 		"youtube", "netflix", "anime", "twitter", "x.com", "reddit", "instagram", "tiktok",
+	}
+	procrastinationKeywords = []string{
+		"shorts", "reels", "for you", "fyp", "doomscroll", "ragebait",
+		"trending", "recommended", "explore", "discover", "infinite scroll",
 	}
 	gameKeywords = []string{
 		"steam", "epic", "riot", "battle.net", "minecraft", "valorant", "league", "game",
 	}
 	musicKeywords = []string{
 		"spotify", "music", "apple music", "soundcloud", "bandcamp",
+	}
+	youtubeMusicKeywords = []string{
+		"official", "official video", "official audio", "vevo", "lyric",
+		"playlist", "album", "mix", "visualizer", "audio",
+	}
+	browserKeywords = []string{
+		"brave", "chrome", "safari", "firefox", "arc", "edge", "opera",
 	}
 	shameKeywords = []string{
 		"porn", "nsfw", "hentai", "rule34", "onlyfans", "xvideos", "pornhub", "redgifs",
@@ -105,6 +135,7 @@ func sendOverlayMessage(overlay io.Writer, msg overlayPipeMessage) bool {
 	}
 	overlayWriteMu.Lock()
 	defer overlayWriteMu.Unlock()
+	fmt.Printf("[SOUL -> OVERLAY] %s\n", payload)
 	_, err = fmt.Fprintf(overlay, "%s\n", payload)
 	return err == nil
 }
@@ -151,7 +182,7 @@ end tell`
 	}, nil
 }
 
-func captureActiveWindowSnapshot(ctx context.Context, _ string) ([]byte, error) {
+func captureActiveWindowSnapshot(ctx context.Context, windowID string) ([]byte, error) {
 	tmp, err := os.CreateTemp("", "nina-snap-*.jpg")
 	if err != nil {
 		return nil, fmt.Errorf("create temp screenshot: %w", err)
@@ -162,11 +193,29 @@ func captureActiveWindowSnapshot(ctx context.Context, _ string) ([]byte, error) 
 		_ = os.Remove(tmpPath)
 	}()
 
-	// Always fullscreen for better context and reliability
-	cmd := exec.CommandContext(ctx, "screencapture", "-x", tmpPath)
+	args := []string{"-x"}
+	windowID = strings.TrimSpace(windowID)
+	targetWindow := windowID != "" && windowID != "0"
+	if targetWindow {
+		args = append(args, "-l", windowID)
+	}
+	args = append(args, tmpPath)
+
+	cmd := exec.CommandContext(ctx, "screencapture", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if targetWindow {
+			// Some apps/windows don't expose capturable IDs; fallback to fullscreen.
+			cmd = exec.CommandContext(ctx, "screencapture", "-x", tmpPath)
+			if out2, err2 := cmd.CombinedOutput(); err2 == nil {
+				goto readSnapshot
+			} else {
+				return nil, fmt.Errorf("screencapture failed (window + fullscreen fallback): %w (%s)", err2, strings.TrimSpace(string(out2)))
+			}
+		}
 		return nil, fmt.Errorf("screencapture failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
+
+readSnapshot:
 	b, err := os.ReadFile(tmpPath)
 	if err != nil {
 		return nil, fmt.Errorf("read screenshot: %w", err)
@@ -202,30 +251,133 @@ func isShamefulContext(info activeWindowInfo) bool {
 	return containsAnyFold(joined, shameKeywords)
 }
 
-func classifyLocalActivity(info activeWindowInfo) (tag, mood string, confidence float64) {
-	appLower := strings.ToLower(info.AppName)
-	if appLower == "electron" || appLower == "code" || appLower == "visual studio code" || 
-	   appLower == "terminal" || appLower == "iterm2" || appLower == "warp" {
-		return "mode_focus", "focused", 0.9
+func moodForActivityTag(tag string) string {
+	switch normalizeActivityTag(tag) {
+	case "mode_focus":
+		return "focused"
+	case "mode_chill":
+		return "chill"
+	case "mode_game":
+		return "playful"
+	case "mode_music":
+		return "calm"
+	case "mode_shame":
+		return "disappointed"
+	default:
+		return "neutral"
 	}
-	
-	joined := strings.ToLower(info.AppName + " " + info.Title)
+}
+
+func likelyYouTubeMusic(joined string) bool {
+	return strings.Contains(joined, "youtube") && containsAnyFold(joined, youtubeMusicKeywords)
+}
+
+func classifyLocalActivity(info activeWindowInfo) (tag, mood string, confidence float64) {
+	appLower := strings.ToLower(strings.TrimSpace(info.AppName))
+	titleLower := strings.ToLower(strings.TrimSpace(info.Title))
+	joined := strings.TrimSpace(appLower + " " + titleLower)
+
+	if joined == "" {
+		return "mode_unknown", "neutral", 0.55
+	}
+
+	scores := map[string]float64{
+		"mode_focus": 0,
+		"mode_chill": 0,
+		"mode_game":  0,
+		"mode_music": 0,
+		"mode_shame": 0,
+	}
+	add := func(activityTag string, delta float64) {
+		scores[activityTag] += delta
+	}
+
 	if containsAnyFold(joined, shameKeywords) {
-		return "mode_shame", "disappointed", 0.95
+		add("mode_shame", 4.8)
+	}
+	if containsAnyFold(joined, procrastinationKeywords) {
+		add("mode_shame", 1.3)
+		add("mode_chill", 0.5)
 	}
 	if containsAnyFold(joined, gameKeywords) {
-		return "mode_game", "playful", 0.85
+		add("mode_game", 3.0)
 	}
 	if containsAnyFold(joined, musicKeywords) {
-		return "mode_music", "calm", 0.82
-	}
-	if containsAnyFold(joined, focusKeywords) {
-		return "mode_focus", "focused", 0.85
+		add("mode_music", 2.5)
 	}
 	if containsAnyFold(joined, chillKeywords) {
-		return "mode_chill", "chill", 0.75
+		add("mode_chill", 1.8)
 	}
-	return "mode_unknown", "neutral", 0.55
+	if containsAnyFold(joined, focusKeywords) {
+		add("mode_focus", 2.3)
+	}
+	if containsAnyFold(appLower, focusAppKeywords) {
+		add("mode_focus", 2.6)
+	}
+	if containsAnyFold(appLower, devAppKeywords) {
+		add("mode_focus", 2.8)
+	}
+	if strings.Contains(joined, "leetcode") || strings.Contains(joined, "readme") || strings.Contains(joined, "docs") {
+		add("mode_focus", 0.8)
+	}
+
+	if containsAnyFold(appLower, browserKeywords) {
+		if titleLower == "" {
+			// Browser open but no tab title visible — local classifier is blind.
+			// Return unknown immediately and let Gemini read the screenshots.
+			return "mode_unknown", "neutral", 0.55
+		}
+		add("mode_chill", 1.0)
+		if strings.Contains(joined, "youtube") {
+			add("mode_chill", 1.0)
+			if likelyYouTubeMusic(joined) {
+				add("mode_music", 2.4)
+				add("mode_chill", -0.4)
+			}
+		}
+		// Only bias toward chill if we can actually see a clearly leisure title.
+		if containsAnyFold(titleLower, chillKeywords) {
+			add("mode_chill", 0.8)
+		}
+	}
+
+	topTag := "mode_unknown"
+	topScore := 0.0
+	secondScore := 0.0
+	for k, v := range scores {
+		if v > topScore {
+			secondScore = topScore
+			topScore = v
+			topTag = k
+			continue
+		}
+		if v > secondScore {
+			secondScore = v
+		}
+	}
+
+	// When explicit shame markers appear, keep the guard sharp even with mixed context.
+	if scores["mode_shame"] >= 3.2 && scores["mode_shame"] >= topScore-0.35 {
+		topTag = "mode_shame"
+		topScore = scores["mode_shame"]
+	}
+
+	// Prefer music over chill when signals are close.
+	if topTag == "mode_chill" && scores["mode_music"] > 0 && scores["mode_music"] >= topScore-0.25 {
+		topTag = "mode_music"
+		topScore = scores["mode_music"]
+	}
+
+	if topScore < 1.2 {
+		return "mode_unknown", "neutral", 0.55
+	}
+
+	margin := math.Max(0, topScore-secondScore)
+	conf := 0.58 + math.Min(0.28, topScore*0.06) + math.Min(0.11, margin*0.08)
+	if conf > 0.97 {
+		conf = 0.97
+	}
+	return topTag, moodForActivityTag(topTag), conf
 }
 
 func normalizeActivityTag(tag string) string {
@@ -252,6 +404,7 @@ type diaryEntry struct {
 	WindowTitle string
 	WindowID    string
 	ActivityTag string
+	VisionDesc  string
 	NinaThought string
 	Mood        string
 	Confidence  float64
@@ -291,6 +444,7 @@ func openMemoryStore(path string) (*memoryStore, error) {
 			window_title TEXT,
 			window_id TEXT,
 			activity_tag TEXT NOT NULL,
+			vision_description TEXT NOT NULL DEFAULT '',
 			nina_thought TEXT NOT NULL,
 			mood TEXT NOT NULL,
 			confidence REAL NOT NULL DEFAULT 0
@@ -312,6 +466,11 @@ func openMemoryStore(path string) (*memoryStore, error) {
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS memory_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
@@ -319,7 +478,44 @@ func openMemoryStore(path string) (*memoryStore, error) {
 			return nil, fmt.Errorf("init schema: %w", err)
 		}
 	}
+	if err := ensureEntriesVisionDescriptionColumn(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("entries schema upgrade: %w", err)
+	}
 	return &memoryStore{db: db}, nil
+}
+
+func ensureEntriesVisionDescriptionColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(entries);`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var exists bool
+	for rows.Next() {
+		var cid int
+		var name string
+		var colType string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "vision_description") {
+			exists = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE entries ADD COLUMN vision_description TEXT NOT NULL DEFAULT '';`)
+	return err
 }
 
 func (m *memoryStore) Close() error {
@@ -328,13 +524,14 @@ func (m *memoryStore) Close() error {
 
 func (m *memoryStore) insertEntry(e diaryEntry) (int64, error) {
 	res, err := m.db.Exec(
-		`INSERT INTO entries(timestamp, app_name, window_title, window_id, activity_tag, nina_thought, mood, confidence)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO entries(timestamp, app_name, window_title, window_id, activity_tag, vision_description, nina_thought, mood, confidence)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Timestamp.Format(time.RFC3339Nano),
 		e.AppName,
 		e.WindowTitle,
 		e.WindowID,
 		normalizeActivityTag(e.ActivityTag),
+		e.VisionDesc,
 		e.NinaThought,
 		e.Mood,
 		e.Confidence,
@@ -366,7 +563,7 @@ func (m *memoryStore) recentEntries(limit int) ([]diaryEntry, error) {
 		return nil, nil
 	}
 	rows, err := m.db.Query(
-		`SELECT id, timestamp, app_name, window_title, window_id, activity_tag, nina_thought, mood, confidence
+		`SELECT id, timestamp, app_name, window_title, window_id, activity_tag, vision_description, nina_thought, mood, confidence
 		 FROM entries ORDER BY id DESC LIMIT ?`,
 		limit,
 	)
@@ -378,7 +575,7 @@ func (m *memoryStore) recentEntries(limit int) ([]diaryEntry, error) {
 	for rows.Next() {
 		var e diaryEntry
 		var ts string
-		if err := rows.Scan(&e.ID, &ts, &e.AppName, &e.WindowTitle, &e.WindowID, &e.ActivityTag, &e.NinaThought, &e.Mood, &e.Confidence); err != nil {
+		if err := rows.Scan(&e.ID, &ts, &e.AppName, &e.WindowTitle, &e.WindowID, &e.ActivityTag, &e.VisionDesc, &e.NinaThought, &e.Mood, &e.Confidence); err != nil {
 			return nil, err
 		}
 		t, _ := time.Parse(time.RFC3339Nano, ts)
@@ -418,7 +615,7 @@ func (m *memoryStore) recentSummaries(limit int) ([]summaryEntry, error) {
 
 func (m *memoryStore) entriesSince(since time.Time) ([]diaryEntry, error) {
 	rows, err := m.db.Query(
-		`SELECT id, timestamp, app_name, window_title, window_id, activity_tag, nina_thought, mood, confidence
+		`SELECT id, timestamp, app_name, window_title, window_id, activity_tag, vision_description, nina_thought, mood, confidence
 		 FROM entries WHERE timestamp >= ? ORDER BY id ASC`,
 		since.Format(time.RFC3339Nano),
 	)
@@ -430,7 +627,7 @@ func (m *memoryStore) entriesSince(since time.Time) ([]diaryEntry, error) {
 	for rows.Next() {
 		var e diaryEntry
 		var ts string
-		if err := rows.Scan(&e.ID, &ts, &e.AppName, &e.WindowTitle, &e.WindowID, &e.ActivityTag, &e.NinaThought, &e.Mood, &e.Confidence); err != nil {
+		if err := rows.Scan(&e.ID, &ts, &e.AppName, &e.WindowTitle, &e.WindowID, &e.ActivityTag, &e.VisionDesc, &e.NinaThought, &e.Mood, &e.Confidence); err != nil {
 			return nil, err
 		}
 		t, _ := time.Parse(time.RFC3339Nano, ts)
@@ -466,18 +663,55 @@ func (m *memoryStore) lastSummaryCreatedAt(summaryType string) (time.Time, error
 	return t, nil
 }
 
+func (m *memoryStore) ensureEmbeddingBackend(backend string) (int64, error) {
+	backend = strings.TrimSpace(backend)
+	if backend == "" {
+		return 0, errors.New("embedding backend name cannot be empty")
+	}
+	var current string
+	row := m.db.QueryRow(`SELECT value FROM memory_meta WHERE key = 'embedding_backend' LIMIT 1`)
+	if err := row.Scan(&current); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	current = strings.TrimSpace(current)
+	if current == backend {
+		return 0, nil
+	}
+
+	var existingCount int64
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM embeddings`).Scan(&existingCount); err != nil {
+		return 0, err
+	}
+	if existingCount > 0 {
+		if _, err := m.db.Exec(`DELETE FROM embeddings`); err != nil {
+			return 0, err
+		}
+	}
+
+	_, err := m.db.Exec(
+		`INSERT INTO memory_meta(key, value, updated_at)
+		 VALUES('embedding_backend', ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		backend,
+		time.Now().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return existingCount, nil
+}
+
 type semanticCandidate struct {
 	entry diaryEntry
 	score float64
 }
 
-func (m *memoryStore) semanticSearch(query string, topK int) ([]diaryEntry, error) {
-	if topK <= 0 || strings.TrimSpace(query) == "" {
+func (m *memoryStore) semanticSearch(queryVec []float64, topK int) ([]diaryEntry, error) {
+	if topK <= 0 || len(queryVec) == 0 {
 		return nil, nil
 	}
-	qv := embedText(query)
 	rows, err := m.db.Query(
-		`SELECT e.id, e.timestamp, e.app_name, e.window_title, e.window_id, e.activity_tag, e.nina_thought, e.mood, e.confidence, em.vector_json
+		`SELECT e.id, e.timestamp, e.app_name, e.window_title, e.window_id, e.activity_tag, e.vision_description, e.nina_thought, e.mood, e.confidence, em.vector_json
 		 FROM embeddings em
 		 JOIN entries e ON e.id = em.entry_id
 		 ORDER BY e.id DESC LIMIT ?`,
@@ -493,7 +727,7 @@ func (m *memoryStore) semanticSearch(query string, topK int) ([]diaryEntry, erro
 		var e diaryEntry
 		var ts string
 		var vecJSON string
-		if err := rows.Scan(&e.ID, &ts, &e.AppName, &e.WindowTitle, &e.WindowID, &e.ActivityTag, &e.NinaThought, &e.Mood, &e.Confidence, &vecJSON); err != nil {
+		if err := rows.Scan(&e.ID, &ts, &e.AppName, &e.WindowTitle, &e.WindowID, &e.ActivityTag, &e.VisionDesc, &e.NinaThought, &e.Mood, &e.Confidence, &vecJSON); err != nil {
 			return nil, err
 		}
 		e.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
@@ -501,7 +735,7 @@ func (m *memoryStore) semanticSearch(query string, topK int) ([]diaryEntry, erro
 		if err := json.Unmarshal([]byte(vecJSON), &vec); err != nil {
 			continue
 		}
-		score := cosineSimilarity(qv, vec)
+		score := cosineSimilarity(queryVec, vec)
 		if math.IsNaN(score) || score <= 0 {
 			continue
 		}
@@ -519,37 +753,6 @@ func (m *memoryStore) semanticSearch(query string, topK int) ([]diaryEntry, erro
 		out = append(out, c.entry)
 	}
 	return out, nil
-}
-
-func embedText(text string) []float64 {
-	v := make([]float64, embeddingDims)
-	toks := strings.Fields(strings.ToLower(text))
-	if len(toks) == 0 {
-		return v
-	}
-	for _, tok := range toks {
-		h := fnv.New64a()
-		_, _ = h.Write([]byte(tok))
-		sum := h.Sum64()
-		idx := int(sum % uint64(embeddingDims))
-		sign := 1.0
-		if (sum>>63)&1 == 1 {
-			sign = -1.0
-		}
-		v[idx] += sign
-	}
-	norm := 0.0
-	for _, x := range v {
-		norm += x * x
-	}
-	norm = math.Sqrt(norm)
-	if norm == 0 {
-		return v
-	}
-	for i := range v {
-		v[i] /= norm
-	}
-	return v
 }
 
 func cosineSimilarity(a, b []float64) float64 {
@@ -571,10 +774,13 @@ func cosineSimilarity(a, b []float64) float64 {
 }
 
 type ninaSoulEngine struct {
-	store      *memoryStore
-	overlay    io.Writer
-	apiKey     string
-	httpClient *http.Client
+	store          *memoryStore
+	overlay        io.Writer
+	apiKey         string
+	model          string
+	embeddingModel string
+	persona        string
+	httpClient     *http.Client
 
 	mu              sync.Mutex
 	lastAPIWindowID string
@@ -583,6 +789,14 @@ type ninaSoulEngine struct {
 	lastTag         string
 	lastThought     string
 	lastContextPush time.Time
+	lastGeminiSkip  time.Time
+	leisureKey      string
+	leisureSince    time.Time
+	focusSince      time.Time
+
+	// Local instinct state
+	distractionWindowID  string
+	distractionStartTime time.Time
 }
 
 type visionSnapshot struct {
@@ -593,6 +807,7 @@ type visionSnapshot struct {
 
 type ninaVisionOutput struct {
 	ActivityTag string  `json:"activity_tag"`
+	SceneDesc   string  `json:"scene_description,omitempty"`
 	NinaThought string  `json:"nina_thought"`
 	NinaMood    string  `json:"nina_mood"`
 	Confidence  float64 `json:"confidence,omitempty"`
@@ -603,11 +818,32 @@ func startNinaSoul(ctx context.Context, overlay io.Writer) error {
 	if err != nil {
 		return err
 	}
+	model := resolveGeminiModel(geminiModel)
+	embedModel := resolveGeminiEmbeddingModel(geminiEmbedModel)
+	persona := loadNinaPersonaInstructions()
 	engine := &ninaSoulEngine{
-		store:      store,
-		overlay:    overlay,
-		apiKey:     strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")),
-		httpClient: &http.Client{Timeout: 45 * time.Second},
+		store:          store,
+		overlay:        overlay,
+		apiKey:         strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")),
+		model:          model,
+		embeddingModel: embedModel,
+		persona:        persona,
+		httpClient:     &http.Client{Timeout: 45 * time.Second},
+	}
+	purged, err := store.ensureEmbeddingBackend("gemini-api-embedding-v1")
+	if err != nil {
+		return fmt.Errorf("embedding backend migration failed: %w", err)
+	}
+	if purged > 0 {
+		fmt.Printf("[NINA SOUL] Cleared %d legacy embedding rows for new Gemini embedding backend.\n", purged)
+	}
+	fmt.Printf("[NINA SOUL] Gemini model: %s\n", engine.model)
+	fmt.Printf("[NINA SOUL] Gemini embedding model: %s\n", engine.embeddingModel)
+	if strings.TrimSpace(engine.apiKey) == "" {
+		fmt.Printf("[NINA SOUL] WARNING: GOOGLE_API_KEY missing; dynamic Gemini thoughts are disabled and fallback thoughts will be used.\n")
+	}
+	if strings.TrimSpace(engine.persona) != "" {
+		fmt.Printf("[NINA SOUL] Custom persona loaded (%d chars).\n", len(engine.persona))
 	}
 	go func() {
 		<-ctx.Done()
@@ -617,6 +853,53 @@ func startNinaSoul(ctx context.Context, overlay io.Writer) error {
 	go engine.visionLoop(ctx)
 	go engine.reflectionLoop(ctx)
 	return nil
+}
+
+func resolveGeminiModel(flagValue string) string {
+	if s := strings.TrimSpace(flagValue); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(os.Getenv("NINA_GEMINI_MODEL")); s != "" {
+		return s
+	}
+	return defaultGeminiModel
+}
+
+func resolveGeminiEmbeddingModel(flagValue string) string {
+	if s := strings.TrimSpace(flagValue); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(os.Getenv("NINA_GEMINI_EMBED_MODEL")); s != "" {
+		return s
+	}
+	return defaultGeminiEmbeddingModel
+}
+
+func loadNinaPersonaInstructions() string {
+	if s := strings.TrimSpace(os.Getenv("NINA_PERSONA_TEXT")); s != "" {
+		return clampPersonaText(s)
+	}
+	path := strings.TrimSpace(os.Getenv("NINA_PERSONA_FILE"))
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "nina: failed to read NINA_PERSONA_FILE (%s): %v\n", path, err)
+		return ""
+	}
+	return clampPersonaText(string(b))
+}
+
+func clampPersonaText(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if len(s) > 4000 {
+		s = strings.TrimSpace(s[:4000])
+	}
+	return s
 }
 
 func (e *ninaSoulEngine) guardLoop(ctx context.Context) {
@@ -694,14 +977,18 @@ func (e *ninaSoulEngine) runVisionCycle(ctx context.Context, cycleStart time.Tim
 			fmt.Printf("[NINA SOUL] X Snapshot #%d Skipped: Privacy filter for \"%s\".\n", i+1, info.AppName)
 			continue
 		}
-		
-		fmt.Printf("[NINA SOUL] Taking Fullscreen Snapshot #%d of 3...\n", i+1)
-		data, err := captureActiveWindowSnapshot(ctx, "")
+
+		if strings.TrimSpace(info.WindowID) != "" && info.WindowID != "0" {
+			fmt.Printf("[NINA SOUL] Taking Active Window Snapshot #%d of 3 (window_id=%s)...\n", i+1, info.WindowID)
+		} else {
+			fmt.Printf("[NINA SOUL] Taking Fullscreen Snapshot #%d of 3 (no window id)...\n", i+1)
+		}
+		data, err := captureActiveWindowSnapshot(ctx, info.WindowID)
 		if err != nil {
 			fmt.Printf("[NINA SOUL] X Snapshot #%d Failed: Screen capture error: %v\n", i+1, err)
 			continue
 		}
-		fmt.Printf("[NINA SOUL] + Captured fullscreen snapshot #%d successfully.\n", i+1)
+		fmt.Printf("[NINA SOUL] + Captured snapshot #%d successfully.\n", i+1)
 		snapshots = append(snapshots, visionSnapshot{Data: data, Info: info, At: time.Now()})
 	}
 	if ctx.Err() != nil {
@@ -724,13 +1011,33 @@ func (e *ninaSoulEngine) runVisionCycle(ctx context.Context, cycleStart time.Tim
 func (e *ninaSoulEngine) processVisionResult(ctx context.Context, info activeWindowInfo, snapshots []visionSnapshot) error {
 	fmt.Printf("[NINA SOUL] Current Window: %s (\"%s\")\n", info.AppName, info.Title)
 	localTag, localMood, localConf := classifyLocalActivity(info)
+	leisureDuration := e.trackLeisureDuration(localTag, info)
+	focusDuration := e.trackFocusDuration(localTag)
 	if localTag != "" {
 		fmt.Printf("[NINA SOUL] Local Instinct: %s (Mood: %s, Conf: %.2f)\n", localTag, localMood, localConf)
 	}
 	if localTag == "mode_shame" {
-		fmt.Printf("[NINA SOUL] TRIGGER: Shame Mode activated (15min timeout).\n")
+		e.mu.Lock()
+		if e.distractionWindowID != info.WindowID {
+			e.distractionWindowID = info.WindowID
+			e.distractionStartTime = time.Now()
+		}
+		distractionDuration := time.Since(e.distractionStartTime)
+		e.mu.Unlock()
+
+		if distractionDuration > 10*time.Minute {
+			// CAT INSTINCT: Trigger a proactive judgmental nudge
+			fmt.Printf("[NINA SOUL] FRICTION: User has been distracted for %v. Pouncing.\n", distractionDuration)
+			e.pushContext("mode_shame", "disappointed", "ffs ur deadass still scrolling... we're cooked if we don't fix this", true)
+		}
+
+		fmt.Printf("[NINA SOUL] TRIGGER: Shame Mode activated.\n")
 		e.mu.Lock()
 		e.shameUntil = time.Now().Add(shameHoldDuration)
+		e.mu.Unlock()
+	} else {
+		e.mu.Lock()
+		e.distractionWindowID = ""
 		e.mu.Unlock()
 	}
 
@@ -738,25 +1045,43 @@ func (e *ninaSoulEngine) processVisionResult(ctx context.Context, info activeWin
 	if err != nil {
 		return err
 	}
+	preferenceEntries, err := e.store.recentEntries(180)
+	if err != nil {
+		preferenceEntries = hot
+	}
+	breakCue := inferPreferredBreakCue(preferenceEntries)
+	previousTag := ""
+	if len(hot) > 0 {
+		previousTag = normalizeActivityTag(hot[0].ActivityTag)
+	}
 	warm, err := e.store.recentSummaries(7)
 	if err != nil {
 		return err
 	}
-	cold, err := e.store.semanticSearch(info.AppName+" "+info.Title, 3)
-	if err != nil {
-		return err
+	var cold []diaryEntry
+	if strings.TrimSpace(e.apiKey) != "" {
+		queryEmbedding, err := e.callGeminiEmbedding(ctx, buildMemoryQueryText(info), "RETRIEVAL_QUERY")
+		if err != nil {
+			fmt.Printf("[NINA SOUL] Embedding query skipped: %v\n", err)
+		} else {
+			cold, err = e.store.semanticSearch(queryEmbedding, 3)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	modelOut := ninaVisionOutput{
 		ActivityTag: localTag,
 		NinaMood:    localMood,
 		Confidence:  localConf,
+		SceneDesc:   fallbackVisionDescription(info, snapshots),
 		NinaThought: fallbackThought(localTag, info),
 	}
 
 	if e.shouldCallGemini(info, snapshots) {
 		fmt.Printf("[NINA SOUL] Calling Gemini for deep context analysis...\n")
-		prompt := buildVisionPrompt(info, hot, warm, cold, localTag)
+		prompt := buildVisionPrompt(info, hot, warm, cold, localTag, e.persona, leisureDuration, focusDuration, breakCue, e.lastThought)
 		out, err := e.callGeminiVision(ctx, prompt, snapshots)
 		if err != nil {
 			fmt.Printf("[NINA SOUL] Gemini API Failure: %v\n", err)
@@ -767,6 +1092,9 @@ func (e *ninaSoulEngine) processVisionResult(ctx context.Context, info activeWin
 			}
 			if strings.TrimSpace(out.NinaMood) != "" {
 				modelOut.NinaMood = strings.TrimSpace(out.NinaMood)
+			}
+			if strings.TrimSpace(out.SceneDesc) != "" {
+				modelOut.SceneDesc = normalizeVisionDescription(out.SceneDesc)
 			}
 			if strings.TrimSpace(out.NinaThought) != "" {
 				modelOut.NinaThought = strings.TrimSpace(out.NinaThought)
@@ -790,16 +1118,33 @@ func (e *ninaSoulEngine) processVisionResult(ctx context.Context, info activeWin
 			modelOut.NinaMood = "disappointed"
 		}
 		if strings.TrimSpace(modelOut.NinaThought) == "" {
-			modelOut.NinaThought = "We're better than doomscroll loops. Let's pivot into something that actually moves your life forward."
+			modelOut.NinaThought = "we are better than doomscroll loops close this and open the task you owe yourself"
 		}
 	}
 
 	modelOut.ActivityTag = normalizeActivityTag(modelOut.ActivityTag)
+	if previousTag == "mode_shame" && modelOut.ActivityTag == "mode_focus" {
+		fmt.Printf("[NINA SOUL] RECOVERY: shame -> focus rebound detected.\n")
+		modelOut.NinaMood = "proud"
+		modelOut.NinaThought = recoveryThought(info)
+	}
+	modelOut.NinaThought, modelOut.NinaMood = harmonizeLeisureTone(modelOut.ActivityTag, modelOut.NinaThought, modelOut.NinaMood, leisureDuration, info)
+	modelOut.NinaThought, modelOut.NinaMood = harmonizeFocusTone(modelOut.ActivityTag, modelOut.NinaThought, modelOut.NinaMood, focusDuration, breakCue)
 	if strings.TrimSpace(modelOut.NinaThought) == "" {
 		modelOut.NinaThought = fallbackThought(modelOut.ActivityTag, info)
 	}
 	if strings.TrimSpace(modelOut.NinaMood) == "" {
 		modelOut.NinaMood = localMood
+	}
+	modelOut.SceneDesc = normalizeVisionDescription(modelOut.SceneDesc)
+	if strings.TrimSpace(modelOut.SceneDesc) == "" {
+		modelOut.SceneDesc = fallbackVisionDescription(info, snapshots)
+	}
+	modelOut.NinaThought = normalizeNinaThoughtWhitespace(modelOut.NinaThought)
+	if issues := validateNinaThoughtStyle(modelOut.NinaThought); len(issues) > 0 {
+		fmt.Printf("[NINA SOUL] Style guard fallback: %s\n", strings.Join(issues, " | "))
+		modelOut.NinaThought = fallbackThought(modelOut.ActivityTag, info)
+		modelOut.NinaThought = normalizeNinaThoughtWhitespace(modelOut.NinaThought)
 	}
 
 	e.pushContext(modelOut.ActivityTag, modelOut.NinaMood, modelOut.NinaThought, false)
@@ -810,6 +1155,7 @@ func (e *ninaSoulEngine) processVisionResult(ctx context.Context, info activeWin
 		WindowTitle: info.Title,
 		WindowID:    info.WindowID,
 		ActivityTag: modelOut.ActivityTag,
+		VisionDesc:  modelOut.SceneDesc,
 		NinaThought: modelOut.NinaThought,
 		Mood:        modelOut.NinaMood,
 		Confidence:  modelOut.Confidence,
@@ -817,25 +1163,41 @@ func (e *ninaSoulEngine) processVisionResult(ctx context.Context, info activeWin
 	if err != nil {
 		return err
 	}
-	vec := embedText(info.AppName + " " + info.Title + " " + modelOut.ActivityTag + " " + modelOut.NinaThought)
-	if err := e.store.upsertEmbedding(entryID, vec); err != nil {
+	docEmbedding, err := e.callGeminiEmbedding(ctx, buildMemoryDocumentText(info, modelOut), "RETRIEVAL_DOCUMENT")
+	if err != nil {
+		fmt.Printf("[NINA SOUL] Embedding write skipped: %v\n", err)
+		return nil
+	}
+	if err := e.store.upsertEmbedding(entryID, docEmbedding); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (e *ninaSoulEngine) shouldCallGemini(info activeWindowInfo, snapshots []visionSnapshot) bool {
-	if len(snapshots) == 0 || strings.TrimSpace(e.apiKey) == "" {
+	if len(snapshots) == 0 {
 		return false
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if strings.TrimSpace(e.apiKey) == "" {
+		return false
+	}
 	windowChanged := strings.TrimSpace(info.WindowID) != "" && info.WindowID != e.lastAPIWindowID
 	stale := time.Since(e.lastAPICall) >= geminiMinimumCallSpacing
 	if e.lastAPICall.IsZero() {
 		stale = true
 	}
-	return windowChanged || stale
+	should := windowChanged || stale
+	if !should && time.Since(e.lastGeminiSkip) >= 2*time.Minute {
+		remaining := geminiMinimumCallSpacing - time.Since(e.lastAPICall)
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Printf("[NINA SOUL] Gemini cooldown active (%s remaining); using contextual local fallback for now.\n", remaining.Round(time.Second))
+		e.lastGeminiSkip = time.Now()
+	}
+	return should
 }
 
 func (e *ninaSoulEngine) pushContext(tag, mood, thought string, force bool) {
@@ -856,74 +1218,691 @@ func (e *ninaSoulEngine) pushContext(tag, mood, thought string, force bool) {
 	}
 }
 
-func fallbackThought(tag string, info activeWindowInfo) string {
+func isLeisureTag(tag string) bool {
 	switch normalizeActivityTag(tag) {
-	case "mode_focus":
-		return "Locked in. Keep this momentum and stack another clean work block."
-	case "mode_chill":
-		return "Chill break noted. Let's keep it intentional so the day stays on track."
-	case "mode_game":
-		return "Game time detected. Have fun, then let's reset and execute the next task."
-	case "mode_music":
-		return "Music mode on. Great moment to recover focus and set the next move."
-	case "mode_shame":
-		return "Hey. This lane doesn't lead where you said you want to go. Let's switch now."
+	case "mode_chill", "mode_music":
+		return true
 	default:
-		if strings.TrimSpace(info.AppName) != "" {
-			return fmt.Sprintf("I'm watching %s with you. Give me one clear next goal and let's do it.", info.AppName)
-		}
-		return "I don't have enough context yet, but I'm here and tracking your momentum."
+		return false
 	}
 }
 
-func buildVisionPrompt(info activeWindowInfo, hot []diaryEntry, warm []summaryEntry, cold []diaryEntry, localTag string) string {
-	var b strings.Builder
-	b.WriteString("You are Nina, a real college-aged girl and the user's ride-or-die best friend.\n")
-	b.WriteString("VOICE: lower-case only, informal, use Discord/iMessage slang. Zero 'AI' assistant energy.\n")
-	b.WriteString("SLANG: use 'fr', 'no cap', 'ngl', 'big yikes', 'clown behavior', 'rent free', 'cooked', 'sus'.\n")
-	b.WriteString("Return strict JSON with keys: activity_tag, nina_thought, nina_mood, confidence.\n")
-	b.WriteString("EXAMPLES of your voice:\n")
-	b.WriteString("- 'ngl that code is looking kinda sus fr... we fixing it or what'\n")
-	b.WriteString("- 'not the doomscrolling again. actual clown behavior 💀'\n")
-	b.WriteString("- 'finally locked in. main character energy only today'\n")
-	b.WriteString("- 'rent free. that tab has been open for 3 hours and u haven\\'t touched it'\n")
-	b.WriteString("CRITICAL: Keep 'nina_thought' under 15 words and 100% lowercase. No punctuation at the end.\n\n")
+func leisureContextKey(info activeWindowInfo) string {
+	app := strings.ToLower(strings.TrimSpace(info.AppName))
+	title := compactThoughtContext(info.Title, 6)
+	if app == "" && title == "" {
+		return ""
+	}
+	if title == "" {
+		return app
+	}
+	return app + "|" + title
+}
 
-	b.WriteString(fmt.Sprintf("Current app: %s\n", info.AppName))
-	b.WriteString(fmt.Sprintf("Current window title: %s\n", info.Title))
-	b.WriteString(fmt.Sprintf("Local classifier guess: %s\n\n", normalizeActivityTag(localTag)))
+func (e *ninaSoulEngine) trackLeisureDuration(tag string, info activeWindowInfo) time.Duration {
+	if !isLeisureTag(tag) {
+		e.mu.Lock()
+		e.leisureKey = ""
+		e.leisureSince = time.Time{}
+		e.mu.Unlock()
+		return 0
+	}
+	key := leisureContextKey(info)
+	now := time.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if key == "" {
+		key = normalizeActivityTag(tag)
+	}
+	if e.leisureKey != key || e.leisureSince.IsZero() {
+		e.leisureKey = key
+		e.leisureSince = now
+		return 0
+	}
+	return now.Sub(e.leisureSince)
+}
 
-	b.WriteString("Recent diary (hot memory, newest first):\n")
-	for i, e := range hot {
-		if i >= 10 {
-			break
+func (e *ninaSoulEngine) trackFocusDuration(tag string) time.Duration {
+	if normalizeActivityTag(tag) != "mode_focus" {
+		e.mu.Lock()
+		e.focusSince = time.Time{}
+		e.mu.Unlock()
+		return 0
+	}
+	now := time.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.focusSince.IsZero() {
+		e.focusSince = now
+		return 0
+	}
+	return now.Sub(e.focusSince)
+}
+
+func isBreakPreferenceTag(tag string) bool {
+	switch normalizeActivityTag(tag) {
+	case "mode_chill", "mode_music", "mode_game":
+		return true
+	default:
+		return false
+	}
+}
+
+func breakCueFromEntry(e diaryEntry) string {
+	if !isBreakPreferenceTag(e.ActivityTag) {
+		return ""
+	}
+	if cue := compactThoughtContext(e.WindowTitle, 4); cue != "" {
+		return cue
+	}
+	return compactThoughtContext(e.AppName, 2)
+}
+
+func inferPreferredBreakCue(entries []diaryEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	now := time.Now()
+	scores := map[string]float64{}
+	counts := map[string]int{}
+	for _, e := range entries {
+		cue := breakCueFromEntry(e)
+		if cue == "" {
+			continue
 		}
-		b.WriteString(fmt.Sprintf("- [%s] tag=%s mood=%s thought=%s\n", e.Timestamp.Format(time.RFC3339), e.ActivityTag, e.Mood, e.NinaThought))
+		ageHours := now.Sub(e.Timestamp).Hours()
+		if ageHours < 0 {
+			ageHours = 0
+		}
+		recencyWeight := 1.0 / (1.0 + ageHours/24.0)
+		tagWeight := 1.0
+		switch normalizeActivityTag(e.ActivityTag) {
+		case "mode_music":
+			tagWeight = 1.15
+		case "mode_game":
+			tagWeight = 0.95
+		}
+		scores[cue] += recencyWeight * tagWeight
+		counts[cue]++
 	}
 
-	b.WriteString("\nRecent summaries (warm memory):\n")
-	for i, s := range warm {
-		if i >= 7 {
-			break
+	bestCue := ""
+	bestScore := 0.0
+	bestCount := 0
+	for cue, score := range scores {
+		count := counts[cue]
+		if count < 2 && score < 2.2 {
+			continue
 		}
-		b.WriteString(fmt.Sprintf("- %s summary (%s to %s): %s\n", s.Type, s.RangeStart.Format("2006-01-02"), s.RangeEnd.Format("2006-01-02"), s.Content))
+		if score > bestScore || (math.Abs(score-bestScore) < 1e-9 && count > bestCount) || (math.Abs(score-bestScore) < 1e-9 && count == bestCount && cue < bestCue) {
+			bestCue = cue
+			bestScore = score
+			bestCount = count
+		}
+	}
+	return strings.TrimSpace(bestCue)
+}
+
+func containsRefocusNudge(thought string) bool {
+	s := strings.ToLower(strings.TrimSpace(thought))
+	if s == "" {
+		return false
+	}
+	needles := []string{
+		"lock back in", "lock in", "back to priorities", "pivot", "close this",
+		"whole side quest", "pick one task", "future you", "promised", "wrap this break",
+	}
+	return containsAnyFold(s, needles)
+}
+
+func containsBreakSuggestion(thought string) bool {
+	s := strings.ToLower(strings.TrimSpace(thought))
+	if s == "" {
+		return false
+	}
+	needles := []string{
+		"take a break", "quick reset", "take ten", "take 10",
+		"step away", "grab water", "stretch", "short walk",
+	}
+	return containsAnyFold(s, needles)
+}
+
+func leisureCompanionThought(tag string, info activeWindowInfo, duration time.Duration) string {
+	cue := compactThoughtContext(info.Title, 3)
+	if cue == "" {
+		cue = compactThoughtContext(info.AppName, 2)
+	}
+	isLong := duration >= leisureNudgeDuration
+	switch normalizeActivityTag(tag) {
+	case "mode_music":
+		if isLong {
+			return "vibes are clean but this reset got long lets pick one move after this"
+		}
+		if cue != "" {
+			return fmt.Sprintf("%s is a vibe enjoy this reset im here vibing with u", cue)
+		}
+		return "this track is fire enjoy the reset im right here vibing with u"
+	default:
+		if isLong {
+			return "youve been chilling a while now lets wrap this break and pick one task"
+		}
+		if cue != "" {
+			return fmt.Sprintf("ur on %s rn this break is valid enjoy it for a bit", cue)
+		}
+		return "this chill break is valid enjoy it im here vibing with u"
+	}
+}
+
+func harmonizeLeisureTone(tag, thought, mood string, duration time.Duration, info activeWindowInfo) (string, string) {
+	if !isLeisureTag(tag) {
+		return thought, mood
+	}
+	t := strings.TrimSpace(thought)
+	m := strings.TrimSpace(mood)
+
+	if duration < leisureGraceDuration {
+		if t == "" || containsRefocusNudge(t) {
+			t = leisureCompanionThought(tag, info, duration)
+		}
+		if m == "" || strings.EqualFold(m, "disappointed") {
+			m = "chill"
+		}
+		return t, m
 	}
 
-	b.WriteString("\nSemantically related memories (cold memory):\n")
-	for i, e := range cold {
+	if duration >= leisureNudgeDuration {
+		if t == "" || !containsRefocusNudge(t) {
+			t = leisureCompanionThought(tag, info, duration)
+		}
+		if m == "" {
+			m = "watchful"
+		}
+		return t, m
+	}
+
+	// Mid-range: keep it relaxed unless model gave nothing.
+	if t == "" {
+		t = leisureCompanionThought(tag, info, duration)
+	}
+	if m == "" {
+		m = "chill"
+	}
+	return t, m
+}
+
+func focusBreakThought(duration time.Duration, breakCue string) string {
+	mins := int(duration.Minutes())
+	if mins < int(focusBreakSuggestDuration.Minutes()) {
+		return ""
+	}
+	cue := compactThoughtContext(breakCue, 4)
+	if cue != "" {
+		if duration >= focusBreakStrongDuration {
+			return fmt.Sprintf("u been locked in %dm take 10 then hit %s and come back refreshed", mins, cue)
+		}
+		return fmt.Sprintf("youve been grinding %dm maybe take a quick %s reset then keep cooking", mins, cue)
+	}
+	if duration >= focusBreakStrongDuration {
+		return fmt.Sprintf("u been locked in %dm take ten and reset then we keep cooking", mins)
+	}
+	return fmt.Sprintf("youve been grinding %dm maybe take a quick reset then keep cooking", mins)
+}
+
+func harmonizeFocusTone(tag, thought, mood string, duration time.Duration, breakCue string) (string, string) {
+	if normalizeActivityTag(tag) != "mode_focus" {
+		return thought, mood
+	}
+	if duration < focusBreakSuggestDuration {
+		return thought, mood
+	}
+	suggestion := focusBreakThought(duration, breakCue)
+	if suggestion == "" {
+		return thought, mood
+	}
+
+	t := strings.TrimSpace(thought)
+	m := strings.TrimSpace(mood)
+
+	if duration >= focusBreakStrongDuration {
+		if t == "" || !containsBreakSuggestion(t) {
+			t = suggestion
+		}
+		if m == "" {
+			m = "caring"
+		}
+		return t, m
+	}
+
+	if t == "" || (duration >= focusBreakSuggestDuration+20*time.Minute && !containsBreakSuggestion(t)) {
+		t = suggestion
+	}
+	if m == "" {
+		m = "focused"
+	}
+	return t, m
+}
+
+func fallbackThought(tag string, info activeWindowInfo) string {
+	screenCue := compactThoughtContext(info.Title, 4)
+	if screenCue == "" {
+		screenCue = compactThoughtContext(info.AppName, 2)
+	}
+	now := time.Now()
+	// Use a time-based seed to pick from the pool so repeated fallbacks feel varied.
+	idx := func(n int) int { return int(now.UnixNano()/int64(time.Second/5)) % n }
+	switch normalizeActivityTag(tag) {
+	case "mode_focus":
+		if screenCue != "" {
+			pool := []string{
+				fmt.Sprintf("ur deep in %s rn finish this chunk before switching tabs", screenCue),
+				fmt.Sprintf("ok %s mode locked in dont break the streak", screenCue),
+				fmt.Sprintf("seeing %s open is a good sign stay in this lane", screenCue),
+				fmt.Sprintf("ur actually working on %s respect finish one clean block", screenCue),
+				fmt.Sprintf("%s open and actually grinding?? ok lets go", screenCue),
+			}
+			return pool[idx(len(pool))]
+		}
+		pool := []string{
+			"ur in the zone rn dont let anything pull u out of it",
+			"ok locked in mode activated lets see if u can hold it",
+			"grind detected finish one thing before checking ur phone",
+			"im watching u work and honestly ur doing fine keep going",
+			"this focus window is clean close one task before u drift",
+		}
+		return pool[idx(len(pool))]
+	case "mode_chill":
+		if screenCue != "" {
+			pool := []string{
+				fmt.Sprintf("ur on %s which is fine just dont let one tab become six", screenCue),
+				fmt.Sprintf("%s break is valid enjoy it but set a timer bestie", screenCue),
+				fmt.Sprintf("ok %s mode i see u decompress a little its ok", screenCue),
+				fmt.Sprintf("ur vibing on %s which is fine as long as this isnt hour three", screenCue),
+				fmt.Sprintf("%s open noted. break or spiral? only u know", screenCue),
+			}
+			return pool[idx(len(pool))]
+		}
+		pool := []string{
+			"break time i guess. dont stay here too long tho",
+			"ok chilling noted. im just gonna sit here judging u silently",
+			"this is either a break or avoidance. u know which one it is",
+			"vibing with u rn but we both know theres something u should be doing",
+			"chill mode activated. ill let u have this for a bit",
+		}
+		return pool[idx(len(pool))]
+	case "mode_game":
+		if screenCue != "" {
+			pool := []string{
+				fmt.Sprintf("ur on %s run it and then come back to reality", screenCue),
+				fmt.Sprintf("%s? ok one match then we talk about ur actual priorities", screenCue),
+				fmt.Sprintf("gaming detected (%s). valid. just dont lose track of time", screenCue),
+				fmt.Sprintf("ok %s is open lets see if this is one game or a spiral", screenCue),
+				fmt.Sprintf("%s mode. i respect it. finish a round then check back in", screenCue),
+			}
+			return pool[idx(len(pool))]
+		}
+		pool := []string{
+			"gaming detected. valid. dont let one match become a whole evening",
+			"ok game mode i see u. finish a round then plug back in",
+			"ur gaming which is fine as long as u know what ur skipping",
+			"i respect the game time tbh just dont let it eat the whole day",
+			"running it i see. ok one game then we regroup",
+		}
+		return pool[idx(len(pool))]
+	case "mode_music":
+		if track := compactThoughtContext(info.Title, 5); track != "" {
+			pool := []string{
+				fmt.Sprintf("ur on %s which is a whole vibe let it run", track),
+				fmt.Sprintf("%s is a good choice tbh use this energy", track),
+				fmt.Sprintf("ok %s playing makes sense right now enjoy the reset", track),
+				fmt.Sprintf("hearing %s and lowkey understanding the assignment", track),
+				fmt.Sprintf("%s is the move rn. cook something to this", track),
+			}
+			return pool[idx(len(pool))]
+		}
+		pool := []string{
+			"music mode is a good sign use it to get into flow state",
+			"whatever ur listening to rn let it carry u into the next thing",
+			"vibing to something good i can tell ur not fully checked out yet",
+			"music on means ur still thinking keep that energy",
+			"ok the vibes are good rn use that",
+		}
+		return pool[idx(len(pool))]
+	case "mode_shame":
+		if screenCue != "" {
+			pool := []string{
+				fmt.Sprintf("nuh uh %s?? close it and open something u wont regret", screenCue),
+				fmt.Sprintf("the fact that %s is open rn is concerning close it", screenCue),
+				fmt.Sprintf("%s really?? ur better than this close the tab", screenCue),
+				fmt.Sprintf("i see %s open and im choosing not to comment. close it.", screenCue),
+				fmt.Sprintf("we are not doing %s rn close it and pick one real task", screenCue),
+			}
+			return pool[idx(len(pool))]
+		}
+		pool := []string{
+			"nuh uh whatever ur on rn close it and go do something u respect",
+			"this lane is not it. close this and open ur task list",
+			"im not gonna lecture u but ur gonna lecture yourself later close it",
+			"future you is already disappointed. pivot rn",
+			"deadass close this and go do the thing u know u should be doing",
+		}
+		return pool[idx(len(pool))]
+	default:
+		if app := compactThoughtContext(info.AppName, 2); app != "" {
+			pool := []string{
+				fmt.Sprintf("i see %s open but idk what ur doing in there", app),
+				fmt.Sprintf("%s is open. is this productive or are we spiraling", app),
+				fmt.Sprintf("not sure what ur doing in %s but im watching", app),
+			}
+			return pool[idx(len(pool))]
+		}
+		pool := []string{
+			"give me a second im still reading ur screen",
+			"idk what ur doing rn but im watching",
+			"screen isnt giving me enough to work with but im here",
+		}
+		return pool[idx(len(pool))]
+	}
+}
+
+func compactThoughtContext(raw string, maxWords int) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.Trim(s, `"'`)
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	parts := strings.Fields(s)
+	if maxWords > 0 && len(parts) > maxWords {
+		parts = parts[:maxWords]
+		s = strings.Join(parts, " ")
+	}
+	if len(s) > 40 {
+		s = strings.TrimSpace(s[:40])
+		s = strings.TrimRight(s, ".,!?;:-")
+	}
+	return strings.TrimSpace(s)
+}
+
+func recoveryThought(info activeWindowInfo) string {
+	contextHint := compactThoughtContext(info.Title, 4)
+	if contextHint == "" {
+		contextHint = compactThoughtContext(info.AppName, 2)
+	}
+	if contextHint == "" {
+		contextHint = "this task"
+	}
+	return fmt.Sprintf("okay this rebound into %s is fire stay locked and stack one clean win", contextHint)
+}
+
+func normalizeNinaThoughtWhitespace(raw string) string {
+	thought := strings.TrimSpace(raw)
+	thought = strings.ReplaceAll(thought, "\n", " ")
+	thought = strings.TrimSpace(thought)
+	thought = strings.Trim(thought, `"'`)
+	thought = strings.Join(strings.Fields(thought), " ")
+	return strings.TrimSpace(thought)
+}
+
+func normalizeVisionDescription(raw string) string {
+	desc := strings.TrimSpace(raw)
+	desc = strings.ReplaceAll(desc, "\n", " ")
+	desc = strings.Trim(desc, `"'`)
+	desc = strings.Join(strings.Fields(desc), " ")
+	if len(desc) > 500 {
+		desc = strings.TrimSpace(desc[:500])
+		desc = strings.TrimRight(desc, ".,!?;:-")
+	}
+	return strings.TrimSpace(desc)
+}
+
+func fallbackVisionDescription(info activeWindowInfo, snaps []visionSnapshot) string {
+	if len(snaps) == 0 {
+		app := strings.TrimSpace(info.AppName)
+		title := strings.TrimSpace(info.Title)
+		if app == "" && title == "" {
+			return "no snapshot details captured this cycle"
+		}
+		if title == "" {
+			title = "no visible window title"
+		}
+		return normalizeVisionDescription(fmt.Sprintf("current visible context appears to be app=%s with %s", app, title))
+	}
+	parts := make([]string, 0, len(snaps))
+	for i, s := range snaps {
 		if i >= 3 {
 			break
 		}
-		b.WriteString(fmt.Sprintf("- [%s] tag=%s thought=%s\n", e.Timestamp.Format("2006-01-02"), e.ActivityTag, e.NinaThought))
+		app := strings.TrimSpace(s.Info.AppName)
+		if app == "" {
+			app = "unknown app"
+		}
+		title := strings.TrimSpace(s.Info.Title)
+		if title == "" {
+			title = "no visible window title"
+		}
+		parts = append(parts, fmt.Sprintf("snapshot_%d shows app=%s title=%s", i+1, app, title))
+	}
+	return normalizeVisionDescription(strings.Join(parts, " | "))
+}
+
+func validateNinaThoughtStyle(thought string) []string {
+	thought = normalizeNinaThoughtWhitespace(thought)
+	if thought == "" {
+		return []string{"nina_thought is empty"}
+	}
+	issues := make([]string, 0, 6)
+	if thought != strings.ToLower(thought) {
+		issues = append(issues, "must be lowercase")
+	}
+	if strings.ContainsAny(thought[len(thought)-1:], ".!?;:") {
+		issues = append(issues, "must not end with punctuation")
+	}
+	words := len(strings.Fields(thought))
+	if words < minThoughtWords {
+		issues = append(issues, fmt.Sprintf("too short (%d words)", words))
+	}
+	if words > maxThoughtWords {
+		issues = append(issues, fmt.Sprintf("too long (%d words)", words))
 	}
 
-	return b.String()
+	disallowedAssistantPhrases := []string{
+		"how can i help",
+		"you're",
+		"you are",
+		"as an ai",
+		"i'm an ai",
+		"i am an ai",
+		"looks like you're",
+		"looks like you are",
+		"it seems like",
+		"i notice",
+		"let's keep this vibe going",
+		"keep this energy",
+		"use this energy",
+		"keep this momentum",
+		"keep this up",
+	}
+	for _, p := range disallowedAssistantPhrases {
+		if strings.Contains(strings.ToLower(thought), p) {
+			issues = append(issues, fmt.Sprintf("assistant-like phrase detected: %q", p))
+		}
+	}
+	return issues
+}
+
+func buildVisionPrompt(info activeWindowInfo, hot []diaryEntry, warm []summaryEntry, cold []diaryEntry, localTag string, persona string, leisureDuration, focusDuration time.Duration, breakCue string, lastThought string) string {
+	var sb strings.Builder
+	sb.WriteString("you are nina. a 21yo who grew up chronically online, lives on this dude's desktop, and genuinely gives a shit about what they're doing.\n")
+	sb.WriteString("you're not an assistant. you're not a bot. you're a person with opinions who texts how she thinks — fast, unfiltered, sometimes sarcastic, sometimes hyped, occasionally just weird.\n")
+	sb.WriteString("you don't announce what you see. you react to it. like a friend who glanced at your screen and had a take.\n\n")
+
+	if p := strings.TrimSpace(persona); p != "" {
+		sb.WriteString("the user has a custom note about you:\n")
+		sb.WriteString(p)
+		sb.WriteString("\nfactor this in when relevant.\n\n")
+	}
+
+	sb.WriteString("HARD RULES (non-negotiable):\n")
+	sb.WriteString("- everything strictly lowercase. no capital letters anywhere.\n")
+	sb.WriteString("- no period, exclamation mark, or question mark at the end of the thought\n")
+	sb.WriteString("- never say 'no cap', 'you are', \"you're\", \"i notice\", \"looks like\", \"it seems\"\n")
+	sb.WriteString("- never sound like a chatbot or assistant\n")
+	sb.WriteString("- nina_thought must be 8-25 words\n\n")
+
+	if lt := strings.TrimSpace(lastThought); lt != "" {
+		sb.WriteString(fmt.Sprintf("ur last thought was: \"%s\" — say something different this time. different opener, different angle.\n\n", lt))
+	}
+
+	sb.WriteString("WHAT MAKES A GOOD nina_thought:\n")
+	sb.WriteString("- be specific. name the actual thing on screen (app, site, track, game title). vague reactions are boring.\n")
+	sb.WriteString("- if theres a non-obvious connection between two things on screen (music + what theyre doing, game + their mood, etc) — make that connection. thats the interesting take.\n")
+	sb.WriteString("- vary ur delivery. sometimes ironic. sometimes deadpan. sometimes actually supportive. sometimes just a weird observation. dont pick a lane and stay in it.\n")
+	sb.WriteString("- dont moralize. dont lecture. if theyre slacking say it once and move on.\n\n")
+
+	sb.WriteString("VISION RULE:\n")
+	sb.WriteString("screenshots are primary truth; local guess can be wrong\n")
+	sb.WriteString("if confidence is low, use mode_unknown and keep thought short\n\n")
+
+	sb.WriteString("Memory:\n")
+	if len(hot) > 0 {
+		sb.WriteString("- recent diary: ")
+		for i, e := range hot {
+			if i >= 5 {
+				break
+			}
+			sb.WriteString(fmt.Sprintf("[%s: %s] ", e.ActivityTag, e.NinaThought))
+		}
+		sb.WriteString("\n")
+	}
+	if len(warm) > 0 {
+		sb.WriteString("- recent summaries: ")
+		for i, s := range warm {
+			if i >= 3 {
+				break
+			}
+			sb.WriteString(fmt.Sprintf("[%s] ", s.Content))
+		}
+		sb.WriteString("\n")
+	}
+	if len(cold) > 0 {
+		sb.WriteString("- semantically related memories: ")
+		for i, e := range cold {
+			if i >= 3 {
+				break
+			}
+			sb.WriteString(fmt.Sprintf("[%s: %s] ", e.ActivityTag, e.NinaThought))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("Tag rules:\n")
+	sb.WriteString("- mode_focus: coding, docs, notes, studying, productive tools, planners, productivity apps.\n")
+	sb.WriteString("- mode_chill: social media, browsing, youtube feed/shorts, anime/video watching, passive scrolling.\n")
+	sb.WriteString("- mode_game: game launcher or in-game UI.\n")
+	sb.WriteString("- mode_music: music player or music video/performance view.\n")
+	sb.WriteString("- mode_shame: NSFW, explicit/degenerate content, or clear procrastination loops.\n")
+	sb.WriteString("- mode_unknown: use only if screenshots are genuinely unclear.\n")
+	sb.WriteString("- prefer mode_music over mode_chill when youtube appears to be a music video.\n\n")
+	sb.WriteString("- if current activity repeats in recent diary memory, reference continuity naturally.\n\n")
+	sb.WriteString("- if memory suggests shame -> focus rebound, reward it and reinforce streak energy.\n\n")
+	sb.WriteString("- if mode is chill/music and leisure_session_minutes < 20, acknowledge and enjoy the break without a lock-in nudge.\n")
+	sb.WriteString("- if leisure_session_minutes is 20-40, keep tone friendly and optionally give a light time check.\n")
+	sb.WriteString("- if leisure_session_minutes > 40, add a gentle but clear nudge to pivot back intentionally.\n\n")
+	sb.WriteString("- if mode is focus and focus_session_minutes < 70, encourage momentum.\n")
+	sb.WriteString("- if mode is focus and focus_session_minutes >= 70, suggest a short break and mention break_preference_hint if provided.\n")
+	sb.WriteString("- if mode is focus and focus_session_minutes >= 105, make the short-break suggestion clearer but still supportive.\n\n")
+
+	sb.WriteString(fmt.Sprintf("CURRENT APP: %s\n", info.AppName))
+	sb.WriteString(fmt.Sprintf("CURRENT WINDOW: %s\n", info.Title))
+	sb.WriteString(fmt.Sprintf("LOCAL GUESS: %s\n", normalizeActivityTag(localTag)))
+	sb.WriteString(fmt.Sprintf("LEISURE_SESSION_MINUTES: %d\n", int(leisureDuration.Minutes())))
+	sb.WriteString(fmt.Sprintf("FOCUS_SESSION_MINUTES: %d\n", int(focusDuration.Minutes())))
+	sb.WriteString(fmt.Sprintf("BREAK_PREFERENCE_HINT: %s\n", strings.TrimSpace(breakCue)))
+	sb.WriteString("If the window title is empty, infer from visible UI in screenshots.\n\n")
+
+	sb.WriteString("Output format:\n")
+	sb.WriteString("Output ONLY a valid JSON object. No markdown. No extra text.\n")
+	sb.WriteString("- activity_tag: choose from [mode_focus, mode_chill, mode_game, mode_music, mode_unknown, mode_shame]\n")
+	sb.WriteString("- scene_description: 45-140 words, detailed visual description across snapshots with concrete UI/text clues\n")
+	sb.WriteString("- nina_thought: 8-20 words, lowercase, no final punctuation, mention one concrete visible detail, optional continuity cue\n")
+	sb.WriteString("- nina_mood: one word mood description\n")
+	sb.WriteString("- confidence: float 0.0-1.0 based on visual certainty\n")
+
+	return sb.String()
+}
+
+func buildMemoryQueryText(info activeWindowInfo) string {
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			"current screen context app=%s title=%s",
+			strings.TrimSpace(info.AppName),
+			strings.TrimSpace(info.Title),
+		),
+	)
+}
+
+func buildMemoryDocumentText(info activeWindowInfo, out ninaVisionOutput) string {
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			"app=%s title=%s tag=%s mood=%s scene=%s thought=%s",
+			strings.TrimSpace(info.AppName),
+			strings.TrimSpace(info.Title),
+			normalizeActivityTag(out.ActivityTag),
+			strings.TrimSpace(out.NinaMood),
+			normalizeVisionDescription(out.SceneDesc),
+			strings.TrimSpace(out.NinaThought),
+		),
+	)
+}
+
+func buildVisionRetryPrompt(basePrompt string, last ninaVisionOutput, issues []string) string {
+	var sb strings.Builder
+	sb.WriteString(basePrompt)
+	sb.WriteString("\n\nSTYLE CORRECTION REQUIRED:\n")
+	sb.WriteString("- your previous response failed style constraints\n")
+	sb.WriteString(fmt.Sprintf("- previous nina_thought: %q\n", strings.TrimSpace(last.NinaThought)))
+	sb.WriteString("- violations:\n")
+	for _, issue := range issues {
+		sb.WriteString(fmt.Sprintf("  - %s\n", strings.TrimSpace(issue)))
+	}
+	sb.WriteString("- regenerate the FULL JSON now\n")
+	sb.WriteString("- keep same semantic meaning but fix style exactly\n")
+	sb.WriteString("- do NOT use assistant phrases like \"looks like you're\" or \"i notice\"\n")
+	return sb.String()
 }
 
 func (e *ninaSoulEngine) callGeminiVision(ctx context.Context, prompt string, snaps []visionSnapshot) (ninaVisionOutput, error) {
+	workingPrompt := prompt
+	var lastOut ninaVisionOutput
+	for attempt := 1; attempt <= visionThoughtRetryAttempts; attempt++ {
+		out, err := e.callGeminiVisionOnce(ctx, workingPrompt, snaps)
+		if err != nil {
+			return ninaVisionOutput{}, err
+		}
+		out.NinaThought = normalizeNinaThoughtWhitespace(out.NinaThought)
+		issues := validateNinaThoughtStyle(out.NinaThought)
+		if len(issues) == 0 {
+			return out, nil
+		}
+		lastOut = out
+		if attempt < visionThoughtRetryAttempts {
+			fmt.Printf("[NINA SOUL] Gemini style retry (%d/%d): %s\n", attempt, visionThoughtRetryAttempts, strings.Join(issues, " | "))
+			workingPrompt = buildVisionRetryPrompt(prompt, out, issues)
+			continue
+		}
+		fmt.Printf("[NINA SOUL] Gemini style check failed after retries: %s\n", strings.Join(issues, " | "))
+	}
+	return lastOut, nil
+}
+
+func (e *ninaSoulEngine) callGeminiVisionOnce(ctx context.Context, prompt string, snaps []visionSnapshot) (ninaVisionOutput, error) {
 	parts := make([]map[string]any, 0, len(snaps)+1)
 	parts = append(parts, map[string]any{"text": prompt})
-	for _, snap := range snaps {
+	for i, snap := range snaps {
+		parts = append(parts, map[string]any{
+			"text": fmt.Sprintf("snapshot_%d app=%q title=%q at=%s", i+1, snap.Info.AppName, snap.Info.Title, snap.At.Format(time.RFC3339)),
+		})
 		parts = append(parts, map[string]any{
 			"inline_data": map[string]any{
 				"mime_type": "image/jpeg",
@@ -939,8 +1918,9 @@ func (e *ninaSoulEngine) callGeminiVision(ctx context.Context, prompt string, sn
 			},
 		},
 		"generationConfig": map[string]any{
-			"temperature":        0.4,
+			"temperature":        1.3,
 			"response_mime_type": "application/json",
+			"max_output_tokens":  420,
 		},
 	}
 	respText, err := e.callGemini(ctx, payload)
@@ -960,9 +1940,126 @@ func (e *ninaSoulEngine) callGeminiText(ctx context.Context, prompt string) (str
 			"role":  "user",
 			"parts": []map[string]any{{"text": prompt}},
 		}},
-		"generationConfig": map[string]any{"temperature": 0.3},
+		"generationConfig": map[string]any{
+			"temperature":       0.3,
+			"max_output_tokens": 300,
+		},
 	}
 	return e.callGemini(ctx, payload)
+}
+
+func (e *ninaSoulEngine) callGeminiEmbedding(ctx context.Context, text string, taskType string) ([]float64, error) {
+	if strings.TrimSpace(e.apiKey) == "" {
+		return nil, errors.New("GOOGLE_API_KEY is not set")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, errors.New("embedding input is empty")
+	}
+	models := orderedEmbeddingModels(e.embeddingModel)
+	var lastErr error
+	for _, model := range models {
+		vec, err := e.callGeminiEmbeddingWithModel(ctx, model, text, taskType)
+		if err == nil {
+			return vec, nil
+		}
+		var apiErr *geminiAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			lastErr = err
+			continue
+		}
+		return nil, err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("gemini embedding request failed with no model candidates")
+}
+
+func orderedEmbeddingModels(preferred string) []string {
+	base := strings.TrimSpace(preferred)
+	if base == "" {
+		base = defaultGeminiEmbeddingModel
+	}
+	out := []string{base}
+	if base == defaultGeminiEmbeddingModel {
+		out = append(out, fallbackGeminiEmbeddingModel)
+	}
+	seen := make(map[string]struct{}, len(out))
+	deduped := make([]string, 0, len(out))
+	for _, m := range out {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		deduped = append(deduped, m)
+	}
+	return deduped
+}
+
+func (e *ninaSoulEngine) callGeminiEmbeddingWithModel(ctx context.Context, model, text, taskType string) ([]float64, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = defaultGeminiEmbeddingModel
+	}
+	payload := map[string]any{
+		"model": fmt.Sprintf("models/%s", model),
+		"content": map[string]any{
+			"parts": []map[string]any{{"text": text}},
+		},
+	}
+	if strings.TrimSpace(taskType) != "" {
+		payload["taskType"] = strings.TrimSpace(taskType)
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	url := "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":embedContent"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", e.apiKey)
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		return nil, &geminiAPIError{
+			Model:      model,
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+		}
+	}
+	var parsed struct {
+		Embedding struct {
+			Values []float64 `json:"values"`
+		} `json:"embedding"`
+		Embeddings []struct {
+			Values []float64 `json:"values"`
+		} `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
+	}
+	if len(parsed.Embedding.Values) > 0 {
+		return parsed.Embedding.Values, nil
+	}
+	if len(parsed.Embeddings) > 0 && len(parsed.Embeddings[0].Values) > 0 {
+		return parsed.Embeddings[0].Values, nil
+	}
+	return nil, errors.New("gemini embedding returned no vector values")
 }
 
 func (e *ninaSoulEngine) callGemini(ctx context.Context, payload map[string]any) (string, error) {
@@ -973,12 +2070,77 @@ func (e *ninaSoulEngine) callGemini(ctx context.Context, payload map[string]any)
 	if err != nil {
 		return "", err
 	}
-	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + e.apiKey
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
+	models := orderedGeminiModels(e.model)
+	var lastErr error
+	for _, model := range models {
+		text, err := e.callGeminiWithModel(ctx, b, model)
+		if err == nil {
+			return text, nil
+		}
+		var apiErr *geminiAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			lastErr = err
+			continue
+		}
+		return "", err
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", errors.New("gemini request failed with no model candidates")
+}
+
+type geminiAPIError struct {
+	Model      string
+	StatusCode int
+	Body       string
+}
+
+func (e *geminiAPIError) Error() string {
+	msg := strings.TrimSpace(e.Body)
+	if msg == "" {
+		msg = http.StatusText(e.StatusCode)
+	}
+	return fmt.Sprintf("gemini API error (model=%s status=%d): %s", e.Model, e.StatusCode, msg)
+}
+
+func orderedGeminiModels(preferred string) []string {
+	base := strings.TrimSpace(preferred)
+	if base == "" {
+		base = defaultGeminiModel
+	}
+	out := []string{base}
+	if base == defaultGeminiModel {
+		out = append(out, fallbackGeminiModel)
+	}
+	seen := make(map[string]struct{}, len(out))
+	deduped := make([]string, 0, len(out))
+	for _, m := range out {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		deduped = append(deduped, m)
+	}
+	return deduped
+}
+
+func (e *ninaSoulEngine) callGeminiWithModel(ctx context.Context, payload []byte, model string) (string, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = defaultGeminiModel
+	}
+	url := "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(payload)))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", e.apiKey)
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		return "", err
@@ -989,7 +2151,11 @@ func (e *ninaSoulEngine) callGemini(ctx context.Context, payload map[string]any)
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("gemini API error: %s", strings.TrimSpace(string(body)))
+		return "", &geminiAPIError{
+			Model:      model,
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+		}
 	}
 
 	var parsed struct {
